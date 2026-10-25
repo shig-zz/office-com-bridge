@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from office_bridge.config import Settings
+from office_bridge.errors import BridgeError, ErrorCode
+from office_bridge.operations import registry
+from office_bridge.target import AppKind
+
+_settings = Settings()
+
+
+class FakeTarget:
+    app: AppKind = AppKind.EXCEL
+
+    def __init__(self, app: AppKind) -> None:
+        self.app = app
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def make_target(app: AppKind) -> FakeTarget:
+    target = FakeTarget(app)
+    target.info = {
+        "application": app.value.capitalize(),
+        "document": f"{app.value.capitalize()} doc",
+        "full_name": rf"C:\docs\{app.value.capitalize()} doc",
+        "hwnd": 1234,
+        "pid": 5678,
+        "window_title": f"Doc - {app.value.capitalize()}",
+    }
+    return target
+
+
+def test_inspections_listed_in_capabilities() -> None:
+    cap = registry.capabilities(_settings)
+    names = [item["name"] for item in cap["inspections"]]
+    assert "selection" in names
+    assert "document" in names
+    assert "excel.range" in names
+    assert "powerpoint.slide" in names
+
+
+def test_operations_listed_in_capabilities() -> None:
+    cap = registry.capabilities(_settings)
+    names = [item["name"] for item in cap["operations"]]
+    assert "excel.range.write" in names
+    assert "word.selection.insert_text" in names
+
+
+def test_inspect_rejects_unknown_kind() -> None:
+    with pytest.raises(BridgeError) as excinfo:
+        registry.inspect(FakeTarget(AppKind.EXCEL), "unknown.kind", {}, _settings)
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_OPERATION
+
+
+def test_inspections_validate_matching_app() -> None:
+    with pytest.raises(BridgeError) as app_exc:
+        registry.inspect(
+            make_target(AppKind.WORD),  # Wrong app for excel.range
+            "excel.range",
+            {"address": "A1"},
+            _settings,
+        )
+    assert app_exc.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+
+
+def test_invoke_rejects_unknown_operation() -> None:
+    target = make_target(AppKind.EXCEL)
+
+    with pytest.raises(BridgeError) as excinfo:
+        registry.invoke(target, "excel.random_fake_op", {"address": "A1"}, _settings)
+
+
+def test_invoke_requires_app_match() -> None:
+    word_target = make_target(AppKind.WORD)
+
+    with pytest.raises(BridgeError) as excinfo:
+        registry.invoke(word_target, "excel.range.write", {"address": "A1"}, _settings)
+
+
+def test_set_property_rejects_unknown_name() -> None:
+    target = make_target(AppKind.EXCEL)
+
+    with pytest.raises(BridgeError) as excinfo:
+        registry.set_property(target, "unknown.property", None, {}, _settings)
+
+
+def test_security_flags_in_capabilities() -> None:
+    cap = registry.capabilities(_settings)
+    assert cap["security"]["localhost_only"] is True
+    assert cap["security"]["writes_require_confirmation"] is True
+    assert cap["security"]["allowed_operations_only"] is False
+    assert cap["security"]["general_com_access"] is True
+    blocked = cap["security"]["blocked_calls"]
+    assert blocked["prefixes"] == ["save", "close"]
+    assert "quit" in blocked["names"]
+    assert "exit" in blocked["names"]
+
+
+def test_com_section_in_capabilities() -> None:
+    cap = registry.capabilities(_settings)
+    com = cap["com"]
+    assert com["endpoint"] == "POST /com"
+    assert [mode["name"] for mode in com["modes"]] == ["get", "call", "set"]
+    assert com["roots"] == ["application", "window", "document"]
+    assert "window" in com["examples"]["get"]

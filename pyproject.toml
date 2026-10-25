@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "office-com-bridge"
+version = "0.1.0"
+description = "Local HTTP/CLI bridge between AI agents and running Microsoft Office applications"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+dependencies = [
+    "pywin32>=306; sys_platform == 'win32'",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "typer>=0.12",
+    "pydantic>=2.6",
+    "httpx>=0.26",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+
+[project.scripts]
+office = "office_cli.main:main"
+office-bridge = "office_bridge.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
