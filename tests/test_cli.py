@@ -164,6 +164,79 @@ def test_range_write_with_yes_sends_confirm(monkeypatch) -> None:
     assert params["expected_document"] == "Book1.xlsx"
 
 
+def test_add_hyperlink_dry_run_does_not_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "excel",
+            "range",
+            "add-hyperlink",
+            "E35",
+            "--url",
+            "https://example.com",
+            "--screen-tip",
+            "公式ページ",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.add_hyperlink"
+    assert params["address"] == "E35"
+    assert params["url"] == "https://example.com"
+    assert params["screen_tip"] == "公式ページ"
+    assert params["dry_run"] is True
+    assert "confirm" not in params
+
+
+def test_add_hyperlink_requires_url(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["excel", "range", "add-hyperlink", "E35"])
+    assert result.exit_code == 2
+    assert client.invocations == []
+
+
+def test_add_hyperlink_requires_confirmation_without_tty(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["excel", "range", "add-hyperlink", "E35", "--url", "https://example.com"],
+    )
+    assert result.exit_code == 2
+    assert client.invocations == []
+
+
+def test_add_hyperlink_with_yes_sends_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "excel",
+            "range",
+            "add-hyperlink",
+            "E35",
+            "--url",
+            "https://example.com",
+            "--sub-address",
+            "Sheet2!A1",
+            "--yes",
+            "--expected-document",
+            "Book1.xlsx",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.add_hyperlink"
+    assert params["confirm"] is True
+    assert params["sub_address"] == "Sheet2!A1"
+    assert params["expected_document"] == "Book1.xlsx"
+
+
 def test_word_insert_requires_text(monkeypatch) -> None:
     client = FakeClient()
     install_client(monkeypatch, client)

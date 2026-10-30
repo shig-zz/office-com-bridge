@@ -506,6 +506,62 @@ def excel_range_set_format(
     _run(ctx, action)
 
 
+@excel_range_app.command("add-hyperlink")
+def excel_range_add_hyperlink(
+    ctx: typer.Context,
+    address: str = typer.Argument(..., help="A1-style range, for example E35."),
+    url: str = typer.Option(
+        ...,
+        "--url",
+        help="Hyperlink destination, for example 'https://example.com/'.",
+    ),
+    sub_address: str = typer.Option(
+        None,
+        "--sub-address",
+        help="Anchor inside the destination or a sheet reference, for example 'Sheet2!A1'.",
+    ),
+    screen_tip: str = typer.Option(
+        None, "--screen-tip", help="Tooltip text shown when hovering over the link."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate the range without adding the link."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Add a hyperlink object to an Excel range (or update the existing one)."""
+    params: dict[str, Any] = {"address": address, "url": url, "dry_run": dry_run}
+    if sub_address is not None:
+        params["sub_address"] = sub_address
+    if screen_tip is not None:
+        params["screen_tip"] = screen_tip
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"add hyperlink {url} to {address}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("excel.range.add_hyperlink", params)
+
+    _run(ctx, action)
+
+
 @excel_workbook_app.command("inspect")
 def excel_workbook_inspect(ctx: typer.Context) -> None:
     """Read workbook metadata and worksheet names."""

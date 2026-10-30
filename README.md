@@ -16,7 +16,8 @@ goes through a single STA worker thread.
 - Windows 10 or 11
 - Microsoft Office desktop (Word, Excel, PowerPoint)
 - Python 3.11 or 3.12
-- An OpenCode installation for the agent launcher
+- An agent CLI for the launcher: OpenCode, Claude Code, Codex, or Hermes Agent
+  (or a custom command)
 
 ## Install
 
@@ -27,6 +28,21 @@ python -m venv --system-site-packages .venv
 
 The `--system-site-packages` flag is useful when `pywin32` is already installed
 globally for the same Python version.
+
+### Batch shortcuts (Windows)
+
+- `install.bat` creates `.venv` with a supported Python (3.11 or 3.12), installs
+  the package and dev dependencies, and copies the Office skill for the
+  configured agent (OpenCode by default).
+- `configure.bat` selects OpenCode, Claude Code, Codex, Hermes Agent, or a
+  custom command, and stores the choice in
+  `%LOCALAPPDATA%\office-bridge\agent.json`. The interactive flow can also
+  install the skill immediately.
+- `start.bat` starts the bridge in the current console. Server options are passed
+  through, for example `start.bat --no-hotkey --port 8733`.
+- `start-agent.bat` starts the bridge if needed and launches the configured
+  agent with the Office skill available in the current terminal. Use
+  `start-agent.bat -Agent hermes` for a one-off override.
 
 ## Start the bridge
 
@@ -41,16 +57,16 @@ Defaults:
 - Logs: `%LOCALAPPDATA%\office-bridge\logs`
 
 Open a document in Word, Excel, or PowerPoint, focus its window, and press the
-hotkey. The selected document becomes the bridge target, and OpenCode starts in
-a new Windows Terminal window with the Office skill available, so the agent can
-immediately read or edit that document. Use `--no-hotkey` for health checks or
-tests that do not need target selection:
+hotkey. The selected document becomes the bridge target, and the configured
+agent starts in a new Windows Terminal window with the Office skill available,
+so it can immediately read or edit that document. Use `--no-hotkey` for health
+checks or tests that do not need target selection:
 
 ```powershell
 .\.venv\Scripts\office-bridge --no-hotkey --port 8733
 ```
 
-To disable the automatic OpenCode launch on hotkey while keeping target capture,
+To disable the automatic agent launch on hotkey while keeping target capture,
 set `OFFICE_BRIDGE_LAUNCH_AGENT=0` in the environment before starting the
 bridge.
 
@@ -70,6 +86,7 @@ office excel range write A1:B2 --json "[[1,2],[3,4]]" --dry-run
 office excel range write A1:B2 --json "[[1,2],[3,4]]" --yes
 office excel range copy-format A1:B2 C1:D2 --yes
 office excel range set-format A1:B2 --font-name "MS Gothic" --font-size 11 --halign center --yes
+office excel range add-hyperlink E35 --url "https://example.com/" --yes
 office word selection read
 office word selection insert-text "Replacement" --yes
 office powerpoint slide inspect
@@ -119,6 +136,12 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   far-east), font size, bold, italic, underline, font color, number format,
   horizontal/vertical alignment, wrap, fill color, continuous border and
   border color
+- `excel.range.add_hyperlink` adds a real hyperlink object to a range (blue
+  underlined text alone is not clickable). The link covers the whole range and
+  the top-left cell value is used as display text. If the range already has a
+  hyperlink, its address is updated instead, so the operation is idempotent.
+  Optional `sub_address` (anchor or sheet reference) and `screen_tip` (tooltip)
+  are supported; formula-style strings beginning with `=` are rejected
 - `word.selection.insert_text`
 - `excel.active_sheet` through `/set-property`
 
@@ -149,14 +172,58 @@ with `save` or `close` (plus `quit` and `exit`) are rejected with
 `document.Saved`) are always allowed. Add names to the blocklist with
 `OFFICE_BRIDGE_BLOCKED_CALLS` (comma separated).
 
-## OpenCode launcher
+## Agent selection
+
+Run `configure.bat` without arguments for an interactive choice, or use the
+`office-agent` CLI directly:
+
+```powershell
+.\.venv\Scripts\office-agent list
+.\.venv\Scripts\office-agent set hermes
+.\.venv\Scripts\office-agent show
+.\.venv\Scripts\office-agent install-skill
+```
+
+The same operations are available without the console script:
+
+```powershell
+.\.venv\Scripts\python -m office_bridge.agent_config set hermes
+```
+
+Presets and their default skill locations:
+
+| Agent | Command | Project skill | User skill | Default scope |
+| --- | --- | --- | --- | --- |
+| `opencode` | `opencode` | `.opencode/skills/office` | `~/.config/opencode/skills/office` | project |
+| `claude` | `claude` | `.claude/skills/office` | `~/.claude/skills/office` | project |
+| `codex` | `codex` | `.agents/skills/office` | `~/.agents/skills/office` | project |
+| `hermes` | `hermes -s office` | `.hermes/skills/office` | `%HERMES_HOME%\skills\office` | user |
+| `custom` | `--command` | `--skill-dir` or disabled | `--skill-dir` | project |
+
+Hermes defaults to the user skill directory because project-local skills require
+`hermes skills trust`; it also preloads the skill with `-s office`. For a custom
+agent, provide an executable and extra arguments explicitly:
+
+```powershell
+.\.venv\Scripts\office-agent set custom --command "C:\Tools\agent.exe" --arg=--flag --no-install-skill
+```
+
+Use `--scope user` to install a preset skill globally, or `--skill-dir <path>` to
+choose the destination. `--no-preload` suppresses the Hermes `-s office`
+argument. `--no-install-skill` leaves skill management to you.
+
+The saved configuration is `%LOCALAPPDATA%\office-bridge\agent.json`. Override it
+for one process with `OFFICE_BRIDGE_AGENT` (for example `OFFICE_BRIDGE_AGENT=codex`)
+or point at a different file with `OFFICE_BRIDGE_AGENT_CONFIG`.
+
+The launcher starts the bridge if needed, installs the skill for the selected
+agent, and starts that agent in the current directory:
 
 ```powershell
 .\scripts\start-agent.ps1
+.\scripts\start-agent.ps1 -Agent hermes
 ```
 
-The launcher starts the bridge if needed, copies the Office skill to
-`.opencode/skills/office/SKILL.md`, and starts OpenCode in the current directory.
 The skill teaches the agent when and how to use the CLI.
 
 ## Tests

@@ -49,6 +49,39 @@ def test_operations_listed_in_capabilities() -> None:
     names = [item["name"] for item in cap["operations"]]
     assert "excel.range.write" in names
     assert "word.selection.insert_text" in names
+    assert "excel.range.add_hyperlink" in names
+
+
+def test_add_hyperlink_dispatches_to_excel_operation() -> None:
+    from types import SimpleNamespace
+
+    from test_excel_ops import FakeHyperlinks, FakeRange, FakeWindow
+
+    link_range = FakeRange(1, 1, "https://example.com", address="E35")
+    window = FakeWindow(FakeRange(1, 1, None), {"E35": link_range})
+    target = make_target(AppKind.EXCEL)
+    target.window = window
+
+    result = registry.invoke(
+        target,
+        "excel.range.add_hyperlink",
+        {"address": "E35", "url": "https://example.com", "confirm": True},
+        _settings,
+    )
+    assert result["applied"] is True
+    assert link_range.Hyperlinks.Count == 1
+    assert link_range.Hyperlinks(1).Address == "https://example.com"
+
+
+def test_add_hyperlink_requires_excel_app() -> None:
+    with pytest.raises(BridgeError) as excinfo:
+        registry.invoke(
+            make_target(AppKind.WORD),
+            "excel.range.add_hyperlink",
+            {"address": "A1", "url": "https://example.com"},
+            _settings,
+        )
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
 
 
 def test_inspect_rejects_unknown_kind() -> None:

@@ -1,23 +1,34 @@
 [CmdletBinding()]
 param(
     [string]$SourceRoot = "",
-    [switch]$Global
+    [switch]$Global,
+    [string]$Agent = "",
+    [string]$Scope = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = if ($SourceRoot) { (Resolve-Path -LiteralPath $SourceRoot).Path } else { Split-Path -Parent $PSScriptRoot }
+
+$python = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) {
+    $python = "python"
+}
+
+$arguments = @("-m", "office_bridge.agent_config", "install-skill")
+if ($Agent) {
+    $arguments += @("--agent", $Agent)
+}
+if ($Scope) {
+    $arguments += @("--scope", $Scope)
+}
+elseif ($Global) {
+    $arguments += @("--scope", "user")
+}
+
 $source = Join-Path $Root "skills\office\SKILL.md"
-if (-not (Test-Path -LiteralPath $source)) {
-    throw "Skill source not found: $source"
+if (Test-Path -LiteralPath $source) {
+    $arguments += @("--source", $source)
 }
 
-if ($Global) {
-    $destination = Join-Path $env:USERPROFILE ".config\opencode\skills\office"
-}
-else {
-    $destination = Join-Path $Root ".opencode\skills\office"
-}
-
-New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Copy-Item -LiteralPath $source -Destination (Join-Path $destination "SKILL.md") -Force
-Write-Output (Join-Path $destination "SKILL.md")
+& $python @arguments
+exit $LASTEXITCODE

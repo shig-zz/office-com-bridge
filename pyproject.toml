@@ -28,6 +28,7 @@ dev = [
 [project.scripts]
 office = "office_cli.main:main"
 office-bridge = "office_bridge.server:main"
+office-agent = "office_bridge.agent_config:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

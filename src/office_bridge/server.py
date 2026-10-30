@@ -14,6 +14,7 @@ from pathlib import Path
 import uvicorn
 
 from . import __version__
+from .agent_config import build_launch_argv, get_preset, load_agent_config
 from .api import create_app
 from .com_worker import BridgeCore
 from .config import Settings
@@ -82,23 +83,10 @@ def _beep(kind: int) -> None:
         pass
 
 
-def _find_opencode() -> str | None:
-    for name in ("opencode", "opencode.exe", "opencode.cmd", "opencode.ps1"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
-
-
-def _launch_agent(cwd: str, url: str) -> None:
-    """Start OpenCode in a new terminal window (Windows Terminal when available)."""
-    launcher = _find_opencode()
-    if launcher is None:
-        raise FileNotFoundError("opencode was not found on PATH")
-    if launcher.lower().endswith(".ps1"):
-        command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher]
-    else:
-        command = [launcher]
+def _launch_agent(cwd: str, url: str) -> str:
+    """Start the configured agent in a new terminal window."""
+    config = load_agent_config()
+    command = build_launch_argv(config)
     env = dict(os.environ)
     env["OFFICE_BRIDGE_URL"] = url
     scripts_dir = os.path.dirname(sys.executable)
@@ -113,6 +101,7 @@ def _launch_agent(cwd: str, url: str) -> None:
             env=env,
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
         )
+    return get_preset(config).label
 
 
 def _port_available(host: str, port: int) -> bool:
@@ -201,10 +190,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if settings.launch_agent:
                         try:
-                            _launch_agent(str(Path.cwd()), settings.base_url)
-                            logger.info("launched OpenCode agent in a new terminal")
+                            agent_name = _launch_agent(str(Path.cwd()), settings.base_url)
+                            logger.info("launched %s in a new terminal", agent_name)
                         except Exception:
-                            logger.exception("failed to launch the OpenCode agent")
+                            logger.exception("failed to launch the configured agent")
                 except BridgeError as exc:
                     logger.warning("hotkey rejected: %s: %s", exc.code, exc.message)
                     if settings.beep:

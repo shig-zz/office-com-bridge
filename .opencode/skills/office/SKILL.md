@@ -2,7 +2,6 @@
 name: office
 description: Use when the user asks to read or edit a document that is currently open in Microsoft Word, Excel, or PowerPoint through the local office bridge CLI. Triggers include Word, Excel, PowerPoint, Office, 文書, ワード, エクセル, パワーポイント, ブック, ワークブック, スライド, プレゼン, セル, 表, 選択範囲, シート, ページ, 書式, フォント, フォーマット, 罫線, 塗りつぶし, 行の挿入, 行削除, 図形, 画像挿入, マクロ, reading or writing a range, inserting or deleting rows or columns, adding or editing shapes, changing fonts or cell formatting, running a macro, extracting selected text, inspecting the current slide, and requests such as "この資料を読んで", "開いているExcelを確認して", "選択範囲を書き換えて", "書式を揃えて", "2行目を挿入して", "図形を追加して". Do not use for PDFs, Google Workspace, or files that are not already open in desktop Office.
 license: MIT
-compatibility: opencode
 metadata:
   audience: agents
   transport: local-http-cli
@@ -106,6 +105,25 @@ Rules for formatting writes:
   both Japanese and Western text.
 - Colors are `RRGGBB` hex strings without a leading `#`.
 - Do not change formatting outside the range the user named.
+
+Excel hyperlinks:
+
+Blue underlined text is not clickable: a hyperlink needs a real hyperlink
+object. Use the curated `add-hyperlink` command for that.
+
+```text
+office excel range add-hyperlink "E35" --url "https://example.com/" --dry-run --expected-document "Budget.xlsx"
+office excel range add-hyperlink "E35" --url "https://example.com/" --yes --expected-document "Budget.xlsx"
+```
+
+- The link covers the whole range; the top-left cell value is the display text.
+- If the range already has a hyperlink, its address is updated instead of
+  adding a duplicate (the operation is idempotent).
+- `--sub-address` sets the anchor or a sheet reference (for example
+  `Sheet2!A1`); `--screen-tip` sets the tooltip.
+- Do not try to create hyperlinks through `office com`: `Hyperlinks.Add` needs
+  the range object itself as an argument, and general `call` arguments are
+  literals only.
 
 Word insertion:
 

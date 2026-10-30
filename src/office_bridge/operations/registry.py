@@ -126,6 +126,18 @@ def invoke(
             params=params,
         )
 
+    if operation == "excel.range.add_hyperlink":
+        _require_app(target, AppKind.EXCEL, operation)
+        address = require_str(params, "address")
+        dry_run = optional_bool(params, "dry_run", False)
+        return excel.add_hyperlink(
+            target,
+            address=address,
+            dry_run=dry_run,
+            max_cells=settings.max_cells,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -254,6 +266,36 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "source_address": {"type": "string", "required": True},
                     "address": {"type": "string", "required": True},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.range.add_hyperlink",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Add a real hyperlink object to an A1-style range. The link "
+                    "covers the whole range and the top-left cell value is used as "
+                    "display text. If the range already has a hyperlink, its "
+                    "address (and optionally screen tip and sub address) is updated "
+                    "instead, so the operation is idempotent."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "address": {"type": "string", "required": True},
+                    "url": {
+                        "type": "string",
+                        "required": True,
+                        "note": "Destination, for example 'https://example.com/'. Must not start with '='.",
+                    },
+                    "sub_address": {
+                        "type": "string",
+                        "required": False,
+                        "note": "Anchor inside the destination or a sheet reference such as 'Sheet2!A1'.",
+                    },
+                    "screen_tip": {"type": "string", "required": False},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},

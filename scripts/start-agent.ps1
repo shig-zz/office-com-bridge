@@ -4,8 +4,9 @@ param(
     [switch]$NoHotkey,
     [switch]$KeepBridge,
     [switch]$NoSkillInstall,
+    [string]$Agent = "",
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$OpenCodeArgs = @()
+    [string[]]$AgentArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,10 +40,28 @@ function Show-BridgeLogs {
     }
 }
 
+function Invoke-AgentConfig {
+    param([string[]]$Arguments)
+    $output = & $python -m office_bridge.agent_config @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "office-agent failed with exit code $LASTEXITCODE."
+    }
+    return $output
+}
+
 try {
     $activate = Join-Path $Root ".venv\Scripts\Activate.ps1"
     if (Test-Path -LiteralPath $activate) {
         . $activate
+    }
+
+    $python = Join-Path $Root ".venv\Scripts\python.exe"
+    if (-not (Test-Path -LiteralPath $python)) {
+        $python = "python"
+    }
+
+    if ($Agent) {
+        $env:OFFICE_BRIDGE_AGENT = $Agent
     }
 
     $effectivePort = if ($Port -gt 0) {
@@ -62,17 +81,17 @@ try {
     }
 
     if (-not $NoSkillInstall) {
-        $installed = & (Join-Path $PSScriptRoot "install-skill.ps1")
-        Write-Host "Skill installed: $installed"
+        $installed = Invoke-AgentConfig @("install-skill")
+        Write-Host "Skill: $installed"
     }
 
-    $skillPath = Join-Path $Root ".opencode\skills\office\SKILL.md"
-    if (-not (Test-Path -LiteralPath $skillPath)) {
-        throw "Office skill is not available at $skillPath"
+    $specJson = (Invoke-AgentConfig @("resolve", "--json")) -join "`n"
+    $spec = $specJson | ConvertFrom-Json
+    if (-not $spec.ok) {
+        throw $spec.error
     }
-    $skillHeader = Get-Content -LiteralPath $skillPath -TotalCount 8
-    if (-not ($skillHeader -match "name:\s*office")) {
-        throw "Office skill frontmatter does not contain 'name: office'."
+    if ($spec.skill_dir -and -not $spec.skill_installed -and -not $NoSkillInstall) {
+        throw "Office skill is not installed at $($spec.skill_dir)."
     }
 
     if (Test-Bridge) {
@@ -93,7 +112,7 @@ try {
         }
 
         Write-Host "Starting bridge on port $effectivePort ..."
-        $bridgeProcess = Start-Process -FilePath "python" `
+        $bridgeProcess = Start-Process -FilePath $python `
             -ArgumentList $serverArgs `
             -WorkingDirectory $Root `
             -PassThru `
@@ -125,15 +144,21 @@ try {
         Write-Host "Bridge is healthy."
     }
 
-    $opencodeCommand = Get-Command opencode -ErrorAction SilentlyContinue
-    if (-not $opencodeCommand) {
-        throw "opencode was not found on PATH."
+    $launch = @($spec.launch_argv)
+    if ($launch.Count -eq 0) {
+        throw "No launch command is configured."
+    }
+    $launchExecutable = [string]$launch[0]
+    $launchArguments = if ($launch.Count -gt 1) {
+        $launch[1..($launch.Count - 1)]
+    }
+    else {
+        @()
     }
 
-    Write-Host "Starting OpenCode with the Office skill available."
-    & $opencodeCommand.Source @OpenCodeArgs
-    $openCodeExit = $LASTEXITCODE
-    exit $openCodeExit
+    Write-Host "Starting $($spec.display_name) with the Office skill available."
+    & $launchExecutable @launchArguments @AgentArgs
+    exit $LASTEXITCODE
 }
 catch {
     Write-Host "start-agent.ps1: $($_.Exception.Message)" -ForegroundColor Red

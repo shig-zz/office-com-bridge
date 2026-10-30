@@ -502,6 +502,94 @@ def set_format(
     }
 
 
+def add_hyperlink(
+    target: ResolvedTarget,
+    *,
+    address: str,
+    dry_run: bool,
+    max_cells: int,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    check_expected_document(target, params)
+    url = require_str(params, "url")
+    if url.startswith("="):
+        raise invalid_request(
+            "Hyperlink addresses beginning with '=' are not supported by "
+            "excel.range.add_hyperlink. Provide a URL, or use 'sub_address' for a "
+            "sheet reference such as 'Sheet2!A1'.",
+            {"address": address},
+        )
+    screen_tip = params.get("screen_tip")
+    if screen_tip is not None and (
+        not isinstance(screen_tip, str) or not screen_tip.strip()
+    ):
+        raise invalid_request(
+            "Parameter 'screen_tip' must be a non-empty string.",
+            {"parameter": "screen_tip"},
+        )
+    sub_address = params.get("sub_address")
+    if sub_address is not None and (not isinstance(sub_address, str) or not sub_address.strip()):
+        raise invalid_request(
+            "Parameter 'sub_address' must be a non-empty string.",
+            {"parameter": "sub_address"},
+        )
+    if sub_address is not None and sub_address.startswith("="):
+        raise invalid_request(
+            "Sub addresses beginning with '=' are not supported by "
+            "excel.range.add_hyperlink. Use a sheet reference such as 'Sheet2!A1' "
+            "without a leading '='.",
+            {"parameter": "sub_address"},
+        )
+
+    range_object = _range(target, address)
+    rows, columns = _dims(range_object)
+    check_cell_limit(rows * columns, max_cells)
+
+    try:
+        link_count = int(range_object.Hyperlinks.Count)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+
+    if not dry_run:
+        require_confirm(params, "excel.range.add_hyperlink")
+
+    result: dict[str, Any] = {
+        "address": _address(range_object),
+        "rows": rows,
+        "columns": columns,
+        "cell_count": rows * columns,
+        "url": url,
+        "action": "update" if link_count > 0 else "add",
+        "existing_links": link_count,
+        "dry_run": dry_run,
+        "applied": False,
+    }
+    if dry_run:
+        return result
+
+    try:
+        if link_count > 0:
+            link = range_object.Hyperlinks(1)
+            link.Address = url
+            if sub_address is not None:
+                link.SubAddress = sub_address
+            if screen_tip is not None:
+                link.ScreenTip = screen_tip
+        elif sub_address is not None and screen_tip is not None:
+            range_object.Hyperlinks.Add(range_object, url, sub_address, screen_tip)
+        elif sub_address is not None:
+            range_object.Hyperlinks.Add(range_object, url, sub_address)
+        elif screen_tip is not None:
+            range_object.Hyperlinks.Add(range_object, url, "", screen_tip)
+        else:
+            range_object.Hyperlinks.Add(range_object, url)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+
+    result["applied"] = True
+    return result
+
+
 def set_active_sheet(target: ResolvedTarget, value: Any, params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, str) or not value.strip():
         raise invalid_request("The value for excel.active_sheet must be a sheet name.")

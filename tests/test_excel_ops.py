@@ -18,6 +18,36 @@ class FakeAreas:
         return self._areas[index - 1]
 
 
+class FakeHyperlink:
+    def __init__(self, address: str = "") -> None:
+        self.Address = address
+        self.SubAddress = ""
+        self.ScreenTip = ""
+
+
+class FakeHyperlinks:
+    def __init__(self, links: list[FakeHyperlink] | None = None) -> None:
+        self._links = links or []
+        self.add_calls: list[tuple[Any, str, tuple[Any, ...]]] = []
+
+    @property
+    def Count(self) -> int:
+        return len(self._links)
+
+    def __call__(self, index: int) -> FakeHyperlink:
+        return self._links[index - 1]
+
+    def Add(self, range_object: Any, address: str, *args: Any) -> FakeHyperlink:
+        link = FakeHyperlink(address)
+        if len(args) >= 1:
+            link.SubAddress = args[0]
+        if len(args) >= 2:
+            link.ScreenTip = args[1]
+        self.add_calls.append((range_object, address, args))
+        self._links.append(link)
+        return link
+
+
 class FakeRange:
     def __init__(
         self,
@@ -51,6 +81,7 @@ class FakeRange:
         self.HorizontalAlignment = None
         self.VerticalAlignment = None
         self.WrapText = None
+        self.Hyperlinks = FakeHyperlinks()
         self.copied = False
         self.pasted_with = None
 
@@ -443,3 +474,171 @@ def test_set_format_rejects_invalid_alignment() -> None:
             params={"halign": "diagonal"},
         )
     assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_add_hyperlink_dry_run_does_not_add() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    result = excel.add_hyperlink(
+        target,
+        address="E35",
+        dry_run=True,
+        max_cells=100,
+        params={"url": "https://example.com"},
+    )
+    assert result["dry_run"] is True
+    assert result["applied"] is False
+    assert result["action"] == "add"
+    assert result["existing_links"] == 0
+    assert rng.Hyperlinks.add_calls == []
+
+
+def test_add_hyperlink_requires_confirmation() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.add_hyperlink(
+            target,
+            address="E35",
+            dry_run=False,
+            max_cells=100,
+            params={"url": "https://example.com"},
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert rng.Hyperlinks.add_calls == []
+
+
+def test_add_hyperlink_adds_link_when_confirmed() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    result = excel.add_hyperlink(
+        target,
+        address="E35",
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True, "url": "https://example.com"},
+    )
+    assert result["applied"] is True
+    assert result["action"] == "add"
+    # Hyperlinks.Add receives the range object itself as its first argument.
+    link_range, link_url, extra = rng.Hyperlinks.add_calls[0]
+    assert link_range is rng
+    assert link_url == "https://example.com"
+    assert extra == ()
+    assert rng.Hyperlinks.Count == 1
+    assert rng.Hyperlinks(1).Address == "https://example.com"
+
+
+def test_add_hyperlink_passes_sub_address_and_screen_tip() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    result = excel.add_hyperlink(
+        target,
+        address="E35",
+        dry_run=False,
+        max_cells=100,
+        params={
+            "confirm": True,
+            "url": "https://example.com",
+            "sub_address": "Sheet2!A1",
+            "screen_tip": "公式ページ",
+        },
+    )
+    assert result["applied"] is True
+    _, _, extra = rng.Hyperlinks.add_calls[0]
+    assert extra == ("Sheet2!A1", "公式ページ")
+    link = rng.Hyperlinks(1)
+    assert link.SubAddress == "Sheet2!A1"
+    assert link.ScreenTip == "公式ページ"
+
+
+def test_add_hyperlink_updates_existing_link_instead_of_adding() -> None:
+    existing = FakeHyperlink("https://old.example.com")
+    existing.ScreenTip = "古いヒント"
+    rng = FakeRange(1, 1, "https://old.example.com", address="E35")
+    rng.Hyperlinks = FakeHyperlinks([existing])
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    result = excel.add_hyperlink(
+        target,
+        address="E35",
+        dry_run=False,
+        max_cells=100,
+        params={
+            "confirm": True,
+            "url": "https://new.example.com",
+            "screen_tip": "新しいヒント",
+        },
+    )
+    assert result["applied"] is True
+    assert result["action"] == "update"
+    assert result["existing_links"] == 1
+    assert rng.Hyperlinks.add_calls == []
+    assert rng.Hyperlinks.Count == 1
+    assert existing.Address == "https://new.example.com"
+    assert existing.ScreenTip == "新しいヒント"
+
+
+def test_add_hyperlink_dry_run_reports_update_for_existing_link() -> None:
+    rng = FakeRange(1, 1, "https://old.example.com", address="E35")
+    rng.Hyperlinks = FakeHyperlinks([FakeHyperlink("https://old.example.com")])
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    result = excel.add_hyperlink(
+        target,
+        address="E35",
+        dry_run=True,
+        max_cells=100,
+        params={"url": "https://new.example.com"},
+    )
+    assert result["applied"] is False
+    assert result["action"] == "update"
+    assert rng.Hyperlinks(1).Address == "https://old.example.com"
+
+
+def test_add_hyperlink_requires_url() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.add_hyperlink(target, address="E35", dry_run=True, max_cells=100, params={})
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_add_hyperlink_rejects_formula_addresses() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.add_hyperlink(
+            target,
+            address="E35",
+            dry_run=True,
+            max_cells=100,
+            params={"url": "https://example.com", "sub_address": "=A1"},
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_add_hyperlink_rejects_invalid_screen_tip() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.add_hyperlink(
+            target,
+            address="E35",
+            dry_run=True,
+            max_cells=100,
+            params={"url": "https://example.com", "screen_tip": 42},
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_add_hyperlink_rejects_wrong_expected_document() -> None:
+    rng = FakeRange(1, 1, "https://example.com", address="E35")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"E35": rng}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.add_hyperlink(
+            target,
+            address="E35",
+            dry_run=True,
+            max_cells=100,
+            params={"url": "https://example.com", "expected_document": "Other.xlsx"},
+        )
+    assert excinfo.value.code == ErrorCode.DOCUMENT_MISMATCH
