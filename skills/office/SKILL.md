@@ -129,6 +129,17 @@ Rules for formatting writes:
 - Colors are `RRGGBB` hex strings without a leading `#`.
 - Do not change formatting outside the range the user named.
 
+Reading fills:
+
+A multi-cell `Interior.Color` read is unreliable in this build: a uniform
+range returns the color as a scalar, a mixed range returns 0. Read fills cell
+by cell (`Range("A2").Interior.Color`); a whole-row read is only useful as a
+uniformity test (0 means the columns disagree, so fall back to cell reads).
+Colors are BGR integers (for example 16446960 is `FAF5F0`); when a fix must
+match an existing look, reuse a value read from the sheet itself. Setting a
+fill on a range that has no fill yet (`Interior.Pattern` = -4142) works with
+`Interior.Color` alone — the pattern becomes solid automatically.
+
 Excel hyperlinks:
 
 Blue underlined text is not clickable: a hyperlink needs a real hyperlink
