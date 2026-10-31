@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -642,3 +643,438 @@ def test_add_hyperlink_rejects_wrong_expected_document() -> None:
             params={"url": "https://example.com", "expected_document": "Other.xlsx"},
         )
     assert excinfo.value.code == ErrorCode.DOCUMENT_MISMATCH
+
+
+def test_column_letter_roundtrip() -> None:
+    assert excel._column_letter(1) == "A"
+    assert excel._column_letter(26) == "Z"
+    assert excel._column_letter(27) == "AA"
+    assert excel._column_letter(702) == "ZZ"
+    assert excel._column_letter(703) == "AAA"
+    assert excel._letter_column("C") == 3
+    assert excel._letter_column("AA") == 27
+
+
+def test_compute_order_single_key_ascending_is_stable() -> None:
+    values = [[2, "b"], [1, "z"], [2, "a"], [1, "y"]]
+    assert excel._compute_order(values, [(1, True)]) == [1, 3, 0, 2]
+
+
+def test_compute_order_multi_key_breaks_ties() -> None:
+    values = [["a", "2"], ["b", "1"], ["a", "1"], ["b", "2"]]
+    assert excel._compute_order(values, [(1, True), (2, True)]) == [2, 0, 1, 3]
+
+
+def test_compute_order_descending() -> None:
+    values = [[2], [1], [3]]
+    assert excel._compute_order(values, [(1, False)]) == [2, 0, 1]
+
+
+def test_compute_order_mixed_types_order_blanks_numbers_text() -> None:
+    values = [["x"], [3.0], [None], [1], ["a"]]
+    assert excel._compute_order(values, [(1, True)]) == [2, 3, 1, 4, 0]
+
+
+def test_moves_for_noop_when_sorted() -> None:
+    assert excel._moves_for([0, 1, 2, 3]) == []
+
+
+def test_moves_for_lifts_rows_from_below() -> None:
+    # target order [2, 4, 3, 5, 1] as 0-based original indices
+    moves = excel._moves_for([1, 3, 2, 4, 0])
+    assert all(source > destination for destination, source in moves)
+    # replaying the moves reproduces the target order
+    current = list(range(5))
+    for destination, source in moves:
+        lifted = current[source - 1]
+        current = (
+            current[: destination - 1]
+            + [lifted]
+            + current[destination - 1 : source - 1]
+            + current[source:]
+        )
+    assert current == [1, 3, 2, 4, 0]
+
+
+def test_parse_sort_key_accepts_offset_and_letter() -> None:
+    assert excel._parse_sort_key({"column": 2}, 3, 1) == (2, True)
+    assert excel._parse_sort_key({"column": "C"}, 5, 1) == (3, True)
+    assert excel._parse_sort_key({"column": "B", "order": "descending"}, 2, 1) == (
+        2,
+        False,
+    )
+    # a letter is resolved relative to the range's left edge
+    assert excel._parse_sort_key({"column": "C"}, 3, 2) == (2, True)
+
+
+def test_parse_sort_key_rejects_out_of_range_and_bad_order() -> None:
+    for bad in ({"column": 0}, {"column": 4}, {"column": "D"}, {"column": "AA"}, {"column": 1.5}):
+        with pytest.raises(BridgeError):
+            excel._parse_sort_key(bad, 3, 1)
+    with pytest.raises(BridgeError):
+        excel._parse_sort_key({"column": 1, "order": "sideways"}, 3, 1)
+    with pytest.raises(BridgeError):
+        excel._parse_sort_key("column 1", 3, 1)
+
+
+class FakeSortRow:
+    def __init__(self, sheet: "FakeSortSheet", row: int) -> None:
+        self._sheet = sheet
+        self._row = row
+
+    def Copy(self) -> None:
+        # whole-row copy: the entire row goes on the clipboard
+        self._sheet.copies += 1
+        self._sheet.clipboard = list(self._sheet.grid[self._row - 1])
+        self._sheet.clip_left = 0
+
+    def Insert(self, shift: int = -4121) -> None:
+        self._sheet._insert_row(self._row)
+
+    def Delete(self, shift: int = -4121) -> None:
+        self._sheet._delete_row(self._row)
+
+    @property
+    def RowHeight(self) -> float | None:
+        if self._row in self._sheet.unknown_height_rows:
+            return None
+        return self._sheet.heights[self._row - 1]
+
+    @RowHeight.setter
+    def RowHeight(self, value: float) -> None:
+        # assigning None would raise in the real COM layer
+        if value is None:
+            raise TypeError("float() argument must be a string or a real number, not 'NoneType'")
+        self._sheet.height_sets.append((self._row, value))
+        self._sheet.heights[self._row - 1] = float(value)
+
+
+_ROW_ID_COUNTER = itertools.count(1)
+
+
+class FakeSheetRange:
+    """A live view over the fake grid, mirroring the members excel.sort_range uses.
+
+    Like the installed Excel build, the range keeps track of the rows that existed when
+    it was created: rows deleted afterwards drop out of the view, and rows inserted
+    afterwards are not part of it. Re-resolving the address yields a full fresh view.
+    """
+
+    def __init__(self, sheet: "FakeSortSheet", top: int, left: int, nrows: int, ncols: int) -> None:
+        self._sheet = sheet
+        self.top = top
+        self.left = left
+        self.nrows = nrows
+        self.ncols = ncols
+        self._row_ids = list(sheet.row_ids[top - 1 : top - 1 + nrows])
+
+    @property
+    def Rows(self):
+        return SimpleNamespace(Count=self.nrows)
+
+    @property
+    def Columns(self):
+        sheet_range = self
+
+        class _Columns:
+            @property
+            def Count(self) -> int:
+                return sheet_range.ncols
+
+            def __call__(self, index: int):
+                return SimpleNamespace(Column=sheet_range.left + index - 1)
+
+        return _Columns()
+
+    @property
+    def Row(self) -> int:
+        return self.top
+
+    @property
+    def Value2(self):
+        sheet = self._sheet
+        rows = []
+        for row_id in self._row_ids:
+            if row_id not in sheet.row_ids:
+                continue  # the row was deleted after this range was created
+            index = sheet.row_ids.index(row_id)
+            rows.append(tuple(sheet.grid[index][self.left - 1 : self.left - 1 + self.ncols]))
+        return tuple(rows)
+
+    @property
+    def RowHeight(self) -> None:
+        # In the installed build a multi-row Range.RowHeight is unreliable and can
+        # report None (observed on the main sheet). sort_range must read heights
+        # row by row through sheet.Rows(n).RowHeight instead.
+        return None
+
+    @property
+    def Parent(self) -> "FakeSortSheet":
+        return self._sheet
+
+    def Address(self, row_absolute: bool = True, column_absolute: bool = True) -> str:
+        end_row = self.top + self.nrows - 1
+        end_col = excel._column_letter(self.left + self.ncols - 1)
+        prefix = "$" if row_absolute else ""
+        col_prefix = "$" if column_absolute else ""
+        start = f"{prefix}{col_prefix}{excel._column_letter(self.left)}{self.top}"
+        end = f"{prefix}{col_prefix}{end_col}{end_row}"
+        return f"{start}:{end}" if (self.nrows, self.ncols) != (1, 1) else start
+
+
+def _parse_a1(address: str) -> tuple[int, int, int, int]:
+    text = address.upper().replace("$", "")
+    if ":" in text:
+        start, end = text.split(":", 1)
+    else:
+        start = end = text
+
+    def cell(ref: str) -> tuple[int, int]:
+        letters = 0
+        while letters < len(ref) and ref[letters].isalpha():
+            letters += 1
+        return int(ref[letters:]), excel._letter_column(ref[:letters])
+
+    top, left = cell(start)
+    bottom, right = cell(end)
+    return top, left, bottom - top + 1, right - left + 1
+
+
+class FakeSortSheet:
+    """In-memory sheet modelling the row-move choreography of excel.sort_range.
+
+    Copy puts the row's cells on the clipboard; Rows(n).Insert pastes the clipboard
+    into the inserted row (the behaviour of the installed Excel build); setting the
+    application's CutCopyMode to False clears the clipboard.
+    """
+
+    def __init__(self, grid: list[list], heights: list[float] | None = None) -> None:
+        self.grid = [list(row) for row in grid]
+        self.row_ids = [next(_ROW_ID_COUNTER) for _ in self.grid]
+        width = len(self.grid[0]) if self.grid else 0
+        self.heights = list(heights) if heights else [24.0] * len(self.grid)
+        self._width = width
+        self.clipboard: list | None = None
+        self.clip_left = 0
+        self.copies = 0
+        self.inserts = 0
+        self.deletes = 0
+        self.height_sets: list[tuple[int, float]] = []
+        # rows whose Rows(n).RowHeight reports None (multi-row reads do on some
+        # sheets of the installed build); per-row reads normally still work
+        self.unknown_height_rows: set[int] = set()
+
+    def Range(self, address: str) -> FakeSheetRange:
+        top, left, nrows, ncols = _parse_a1(address)
+        return FakeSheetRange(self, top, left, nrows, ncols)
+
+    def Rows(self, row: int) -> FakeSortRow:
+        return FakeSortRow(self, row)
+
+    def _insert_row(self, row: int) -> None:
+        self.inserts += 1
+        self.grid.insert(row - 1, [None] * self._width)
+        self.row_ids.insert(row - 1, next(_ROW_ID_COUNTER))
+        self.heights.insert(row - 1, self.heights[row - 1] if row <= len(self.heights) else 24.0)
+        if self.clipboard is not None:
+            target = self.grid[row - 1]
+            for offset, value in enumerate(self.clipboard):
+                target[self.clip_left + offset] = value
+
+    def _delete_row(self, row: int) -> None:
+        self.deletes += 1
+        del self.grid[row - 1]
+        del self.row_ids[row - 1]
+        del self.heights[row - 1]
+
+
+def make_sort_sheet() -> FakeSortSheet:
+    # row 1 / row 7 are sentinels that must never be disturbed
+    return FakeSortSheet(
+        [
+            ["TOP", "sentinel"],
+            ["r5", "e"],
+            ["r1", "a"],
+            ["r4", "d"],
+            ["r2", "b"],
+            ["r3", "c"],
+            ["BOTTOM", "sentinel"],
+        ]
+    )
+
+
+def make_sort_target(sheet: FakeSortSheet) -> SimpleNamespace:
+    application = SimpleNamespace(CutCopyMode=False)
+    sheet.application = application
+    window = SimpleNamespace(
+        RangeSelection=FakeRange(1, 1, None),
+        ActiveSheet=SimpleNamespace(Range=sheet.Range),
+    )
+    target = make_target(window)
+    target.application = application
+    return target
+
+
+def test_sort_range_dry_run_reports_plan_without_changes() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    before = [list(row) for row in sheet.grid]
+    result = excel.sort_range(
+        target,
+        address="A2:B6",
+        keys=[{"column": 1}],
+        dry_run=True,
+        max_cells=100,
+        params={},
+    )
+    assert result["dry_run"] is True
+    assert result["applied"] is False
+    assert result["rows"] == 5
+    assert result["columns"] == 2
+    assert result["keys"] == [{"column": 1, "order": "ascending"}]
+    # original data rows (1-based within the range) in the sorted order:
+    # r1 was row 2, r2 row 4, r3 row 5, r4 row 3, r5 row 1
+    assert result["row_order"] == [2, 4, 5, 3, 1]
+    assert result["moves"] == 4
+    assert [list(row) for row in sheet.grid] == before
+    assert sheet.copies == 0
+
+
+def test_sort_range_requires_confirmation() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.sort_range(
+            target,
+            address="A2:B6",
+            keys=[{"column": 1}],
+            dry_run=False,
+            max_cells=100,
+            params={},
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert sheet.copies == 0
+
+
+def test_sort_range_moves_rows_and_verifies() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    result = excel.sort_range(
+        target,
+        address="A2:B6",
+        keys=[{"column": "A"}],
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True},
+    )
+    assert result["applied"] is True
+    assert result["verified"] is True
+    assert sheet.grid[0] == ["TOP", "sentinel"]
+    assert sheet.grid[1:6] == [
+        ["r1", "a"],
+        ["r2", "b"],
+        ["r3", "c"],
+        ["r4", "d"],
+        ["r5", "e"],
+    ]
+    assert sheet.grid[6] == ["BOTTOM", "sentinel"]
+    # one copy/insert/delete per move
+    assert sheet.copies == sheet.inserts == sheet.deletes == 4
+    assert target.application.CutCopyMode is False
+
+
+def test_sort_range_multi_key_and_descending() -> None:
+    sheet = FakeSortSheet(
+        [
+            ["a", "2"],
+            ["b", "1"],
+            ["a", "1"],
+            ["b", "2"],
+        ]
+    )
+    target = make_sort_target(sheet)
+    result = excel.sort_range(
+        target,
+        address="A1:B4",
+        keys=[{"column": 1}, {"column": "B", "order": "descending"}],
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True},
+    )
+    assert result["verified"] is True
+    # a(2), a(1), b(2), b(1): primary asc, tie broken desc
+    assert sheet.grid == [["a", "2"], ["a", "1"], ["b", "2"], ["b", "1"]]
+
+
+def test_sort_range_follows_non_uniform_row_heights() -> None:
+    sheet = make_sort_sheet()
+    # the r5 row (data row 2) has a distinct height that must follow the row
+    sheet.heights[1] = 42.0
+    target = make_sort_target(sheet)
+    result = excel.sort_range(
+        target,
+        address="A2:B6",
+        keys=[{"column": 1}],
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True},
+    )
+    assert result["verified"] is True
+    # r5 ends up last, so the 42pt height must land on the last data row (row 6)
+    assert sheet.heights[1:6] == [24.0, 24.0, 24.0, 24.0, 42.0]
+    assert sheet.height_sets != []
+
+
+def test_sort_range_uniform_heights_need_no_writes() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    excel.sort_range(
+        target,
+        address="A2:B6",
+        keys=[{"column": 1}],
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True},
+    )
+    assert sheet.height_sets == []
+
+
+def test_sort_range_tolerates_unknown_row_heights() -> None:
+    # On some sheets of the installed build even Rows(n).RowHeight can report
+    # None. The sort must still complete and must not write None back.
+    sheet = make_sort_sheet()
+    sheet.unknown_height_rows = {2, 3, 4, 5, 6}
+    target = make_sort_target(sheet)
+    result = excel.sort_range(
+        target,
+        address="A2:B6",
+        keys=[{"column": 1}],
+        dry_run=False,
+        max_cells=100,
+        params={"confirm": True},
+    )
+    assert result["verified"] is True
+    assert sheet.grid[1:6] == [
+        ["r1", "a"],
+        ["r2", "b"],
+        ["r3", "c"],
+        ["r4", "d"],
+        ["r5", "e"],
+    ]
+    assert sheet.height_sets == []
+
+
+def test_sort_range_rejects_bad_keys_parameter() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    for bad in (None, "C", [], [1, 2, 3, 4]):
+        with pytest.raises(BridgeError) as excinfo:
+            excel.sort_range(
+                target,
+                address="A2:B6",
+                keys=bad,
+                dry_run=True,
+                max_cells=100,
+                params={},
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST

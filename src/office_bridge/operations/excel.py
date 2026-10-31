@@ -590,6 +590,231 @@ def add_hyperlink(
     return result
 
 
+_XL_SHIFT_DOWN = -4121
+
+
+def _column_letter(index: int) -> str:
+    letter = ""
+    while index > 0:
+        index, rem = divmod(index - 1, 26)
+        letter = chr(65 + rem) + letter
+    return letter
+
+
+def _letter_column(letter: str) -> int:
+    index = 0
+    for char in letter:
+        index = index * 26 + (ord(char) - 64)
+    return index
+
+
+def _parse_sort_key(raw: Any, column_count: int, start_column: int) -> tuple[int, bool]:
+    """Parse one sort key entry.
+
+    Returns (column_index, ascending) where column_index is 1-based from the left edge
+    of the sort range. The key column may be given as that 1-based offset or as a sheet
+    column letter (for example "C") that must lie inside the sort range.
+    """
+    if not isinstance(raw, dict):
+        raise invalid_request(
+            "Each sort key must be an object like {\"column\": 1, \"order\": \"ascending\"}.",
+            {"parameter": "keys"},
+        )
+    col = raw.get("column")
+    if isinstance(col, bool):
+        raise invalid_request(
+            "Sort key 'column' must be a 1-based column offset number or a sheet column "
+            "letter such as 'C'.",
+            {"parameter": "keys"},
+        )
+    if isinstance(col, int):
+        column_index = col
+    elif isinstance(col, str):
+        letter = col.strip().upper().lstrip("$")
+        if not letter or not letter.isalpha() or len(letter) > 3:
+            raise invalid_request(
+                f"Sort key column {col!r} is not a column letter or number.",
+                {"parameter": "keys"},
+            )
+        column_index = _letter_column(letter) - start_column + 1
+    else:
+        raise invalid_request(
+            "Sort key 'column' must be a 1-based column offset number or a sheet column "
+            "letter such as 'C'.",
+            {"parameter": "keys"},
+        )
+    if not 1 <= column_index <= column_count:
+        raise invalid_request(
+            f"Sort key column is outside the sort range (columns 1-{column_count} from its left edge).",
+            {"parameter": "keys"},
+        )
+    order = raw.get("order", "ascending")
+    if order == "ascending":
+        return column_index, True
+    if order == "descending":
+        return column_index, False
+    raise invalid_request(
+        "Sort key 'order' must be 'ascending' or 'descending'.",
+        {"parameter": "keys"},
+    )
+
+
+def _sort_key_value(value: Any) -> tuple[int, float, str]:
+    """Total ordering for mixed cell values: blanks, then numbers, then text, then others."""
+    if value is None:
+        return (0, 0.0, "")
+    if isinstance(value, bool):
+        return (1, 1.0 if value else 0.0, "")
+    if isinstance(value, (int, float)):
+        return (1, float(value), "")
+    if isinstance(value, str):
+        return (2, 0.0, value)
+    return (3, 0.0, str(value))
+
+
+def _compute_order(values: list[list[Any]], keys: list[tuple[int, bool]]) -> list[int]:
+    """Stable multi-key sort. Returns the original 0-based row indices in target order.
+
+    keys is applied in order (first key is primary). Later keys only break ties of the
+    earlier ones, matching Excel's multi-level sort.
+    """
+    order = list(range(len(values)))
+    for column_index, ascending in reversed(keys):
+        order = sorted(
+            order,
+            key=lambda row_index: _sort_key_value(values[row_index][column_index - 1]),
+            reverse=not ascending,
+        )
+    return order
+
+
+def _moves_for(order: list[int]) -> list[tuple[int, int]]:
+    """Row moves that realize the target order.
+
+    Each move is (destination, source) with 1-based positions, and source is always below
+    destination: the row at source is lifted into destination, shifting the rows between.
+    """
+    current = list(range(len(order)))
+    moves: list[tuple[int, int]] = []
+    for position, wanted in enumerate(order):
+        if current[position] == wanted:
+            continue
+        source = current.index(wanted)
+        moves.append((position + 1, source + 1))
+        current = current[:position] + [wanted] + current[position:source] + current[source + 1 :]
+    return moves
+
+
+def sort_range(
+    target: ResolvedTarget,
+    *,
+    address: str,
+    keys: Any,
+    dry_run: bool,
+    max_cells: int,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Sort the rows of a range in place.
+
+    This Excel build silently ignores Range.Sort calls whose key is a Range object passed
+    through automation (the call returns success but nothing is reordered), and the
+    ListObject sort path is restricted (only the column-orientation value is accepted).
+    Rows are therefore moved with the primitive row operations that do work: the whole
+    source row is copied, an insert at the destination pastes the copy (the inserted row
+    receives the clipboard contents in this build), and the now-duplicated source row is
+    deleted. The copy must span the whole row: inserting a whole row with a narrower
+    clipboard range is rejected by this Excel build as an overlapping copy/paste area.
+    Values, cell formatting, hyperlinks and row structure travel with the row.
+    """
+    check_expected_document(target, params)
+    if not isinstance(keys, list) or not 1 <= len(keys) <= 3:
+        raise invalid_request(
+            "Parameter 'keys' must be an array of 1 to 3 sort key objects.",
+            {"parameter": "keys"},
+        )
+
+    range_object = _range(target, address)
+    try:
+        rows, columns = _dims(range_object)
+        top_row = int(range_object.Row)
+        start_column = int(range_object.Columns(1).Column)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    check_cell_limit(rows * columns, max_cells)
+    if rows < 2:
+        raise invalid_request("The sort range needs at least two rows.", {"address": address})
+
+    try:
+        values = _rectangular(_matrix(range_object.Value2, rows, columns), rows, columns)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+
+    parsed_keys = [_parse_sort_key(key, columns, start_column) for key in keys]
+    order = _compute_order(values, parsed_keys)
+    moves = _moves_for(order)
+
+    result: dict[str, Any] = {
+        "address": _address(range_object),
+        "rows": rows,
+        "columns": columns,
+        "keys": [
+            {"column": index, "order": "ascending" if ascending else "descending"}
+            for index, ascending in parsed_keys
+        ],
+        "moves": len(moves),
+        "row_order": [row_index + 1 for row_index in order],
+        "dry_run": dry_run,
+        "applied": False,
+    }
+    if dry_run:
+        return result
+
+    require_confirm(params, "excel.range.sort")
+
+    sheet = range_object.Parent
+    try:
+        # Read heights per row: Range.RowHeight is unreliable in this build (it can
+        # return None or a scalar for multi-row ranges), while Rows(n).RowHeight works.
+        heights: list[float | None] = []
+        for position in range(rows):
+            height_value = sheet.Rows(top_row + position).RowHeight
+            heights.append(float(height_value) if height_value is not None else None)
+        known_heights = [height for height in heights if height is not None]
+        uniform_height = len(known_heights) > 0 and len(set(known_heights)) <= 1
+        all_heights_known = len(known_heights) == rows
+
+        for destination, source in moves:
+            source_row = top_row + source - 1
+            destination_row = top_row + destination - 1
+            sheet.Rows(source_row).Copy()
+            sheet.Rows(destination_row).Insert(_XL_SHIFT_DOWN)
+            target.application.CutCopyMode = False
+            sheet.Rows(source_row + 1).Delete()
+
+        if not uniform_height and all_heights_known:
+            # The inserted rows inherit a neighbour's height, so re-apply the heights to
+            # follow the new row order. Only done when every height is known: assigning
+            # None to RowHeight raises a COM error, and skipping would lose the heights
+            # of the known rows anyway.
+            for position, row_index in enumerate(order):
+                height = heights[row_index]
+                if height is not None:
+                    sheet.Rows(top_row + position).RowHeight = height
+
+        # Re-resolve the range for the verification read: in this build a Range object
+        # obtained before the row moves shrinks as rows are deleted, so reading through
+        # it would return fewer rows than the range actually holds.
+        final_range = _range(target, address)
+        final_values = _rectangular(_matrix(final_range.Value2, rows, columns), rows, columns)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+
+    expected = [values[row_index] for row_index in order]
+    result["applied"] = True
+    result["verified"] = final_values == expected
+    return result
+
+
 def set_active_sheet(target: ResolvedTarget, value: Any, params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, str) or not value.strip():
         raise invalid_request("The value for excel.active_sheet must be a sheet name.")

@@ -1,6 +1,6 @@
 ---
 name: office
-description: Use when the user asks to read or edit a document that is currently open in Microsoft Word, Excel, or PowerPoint through the local office bridge CLI. Triggers include Word, Excel, PowerPoint, Office, 文書, ワード, エクセル, パワーポイント, ブック, ワークブック, スライド, プレゼン, セル, 表, 選択範囲, シート, ページ, 書式, フォント, フォーマット, 罫線, 塗りつぶし, 行の挿入, 行削除, 図形, 画像挿入, マクロ, reading or writing a range, inserting or deleting rows or columns, adding or editing shapes, changing fonts or cell formatting, running a macro, extracting selected text, inspecting the current slide, and requests such as "この資料を読んで", "開いているExcelを確認して", "選択範囲を書き換えて", "書式を揃えて", "2行目を挿入して", "図形を追加して". Do not use for PDFs, Google Workspace, or files that are not already open in desktop Office.
+description: Use when the user asks to read or edit a document that is currently open in Microsoft Word, Excel, or PowerPoint through the local office bridge CLI. Triggers include Word, Excel, PowerPoint, Office, 文書, ワード, エクセル, パワーポイント, ブック, ワークブック, スライド, プレゼン, セル, 表, 選択範囲, シート, ページ, 書式, フォント, フォーマット, 罫線, 塗りつぶし, 行の挿入, 行削除, 行の移動, 並び替え, 並べ替え, ソート, 昇順, 降順, 図形, 画像挿入, マクロ, reading or writing a range, sorting or reordering rows, moving or inserting or deleting rows or columns, adding or editing shapes, changing fonts or cell formatting, running a macro, extracting selected text, inspecting the current slide, and requests such as "この資料を読んで", "開いているExcelを確認して", "選択範囲を書き換えて", "書式を揃えて", "2行目を挿入して", "この表を日付で並べ替えて", "図形を追加して". Do not use for PDFs, Google Workspace, or files that are not already open in desktop Office.
 license: MIT
 metadata:
   audience: agents
@@ -14,11 +14,34 @@ The `office` CLI talks to a localhost bridge that controls the Office document t
 ## Start every task with context
 
 1. Run `office context` and read the JSON.
-2. Confirm `result.application`, `result.document`, and `result.full_name` match what the user asked about.
-3. If the command fails with `TARGET_NOT_SET`, ask the user to focus the target Office window and press the bridge hotkey (default `Ctrl+Alt+O`), then run `office context` again.
+2. Confirm `result.application`, `result.document`, and `result.full_name` match what the user asked about. For Excel, also note `result.sheet` — that is the active sheet, and every A1-address operation acts on it (see "The active sheet" below).
+3. If the command fails with `TARGET_NOT_SET`, ask the user to focus the target Office window and press the bridge hotkey (default `Ctrl+Alt+O`), then run `office context` again. A fresh attach lands on whatever sheet the user was looking at, so re-check `result.sheet` after every (re)attach.
 4. If the command fails with `BRIDGE_UNREACHABLE`, ask the user to start the bridge or the agent launcher. Do not try to start COM automation yourself.
 
 Run `office capabilities` when you need the exact operation names, the general-operation syntax, the blocklist, or the limits. Never invent operations, COM method names, or command flags.
+
+## The active sheet
+
+In Excel, every operation that takes an A1 address — `range read`, `range write`,
+`range sort`, `range add-hyperlink`, the formatting commands, and `com` expressions
+rooted at `window` such as `ActiveSheet.Range(...)` or `Rows(...)` — acts on the
+workbook's **active sheet**, not on a sheet you name. The same address means
+different things on different sheets, and a write aimed at one sheet lands on
+another when the active sheet is wrong.
+
+- After every (re)attach, re-run `office context` and check `result.sheet` before
+  any Excel write.
+- To work on another sheet, switch it with the normal write workflow (include the
+  switch in the change you describe when asking for approval), then switch back
+  when done:
+
+  ```text
+  office set-property excel.active_sheet --value "気になっている作品" --yes --expected-document "MovieLog.xlsx"
+  ```
+
+- `com` expressions can target a sheet by index without changing the active sheet:
+  `document.Sheets(2).Range("A1")`. Confirm the mapping with
+  `office com get 'document.Worksheets(2).Name'` before relying on an index.
 
 ## Reading
 
@@ -125,6 +148,31 @@ office excel range add-hyperlink "E35" --url "https://example.com/" --yes --expe
   the range object itself as an argument, and general `call` arguments are
   literals only.
 
+Excel row sorting:
+
+`Range.Sort` called through automation is a no-op in this Office build: it
+returns success but leaves the rows untouched. Reordering rows goes through the
+curated sort operation instead, which physically moves whole rows:
+
+```text
+office excel range sort "A2:E54" -c 3 --dry-run --expected-document "MovieLog.xlsx"
+office excel range sort "A2:E54" -c 3 -o descending --yes --expected-document "MovieLog.xlsx"
+office excel range sort "A2:E54" -c 3 -c B -o ascending -o descending --dry-run --expected-document "MovieLog.xlsx"
+```
+
+- `-c` (repeatable, 1–3 times) names the key columns in priority order: a 1-based
+  offset from the range's left edge, or a sheet column letter. `-o` sets the
+  order of the corresponding key (default `ascending`).
+- The sort is stable: rows with equal keys keep their current relative order.
+- Rows move as whole rows — values, cell formatting, and hyperlinks travel with
+  the row. The range must cover every column whose contents must stay aligned,
+  and header rows stay out of the range.
+- `--dry-run` reports the planned `row_order` and `moves` without touching the
+  sheet; it also shows whether the data is already in order (`moves: 0`). An
+  applied sort reports `verified`, whether the sheet matches the plan.
+- Do not try to sort through `office com` with `.Sort(...)`: it succeeds
+  silently and changes nothing.
+
 Word insertion:
 
 ```text
@@ -157,7 +205,8 @@ office com set 'window.Selection.Font.Bold' --value true
 - `com set EXPR --value V` — set a property (write workflow applies). EXPR ends with a property name. V is JSON (`42`, `true`, `"text"`, `[[1,2],[3,4]]`) or a plain string.
 
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
-xlDeleteShiftUp = -4121; PowerPoint: msoShapeRectangle = 1, ppLayoutText = 2).
+xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,
+ppLayoutText = 2).
 Check `office capabilities` for the exact syntax and current limits.
 
 The same write workflow applies: confirm the target with `office context`, get
@@ -165,6 +214,40 @@ user approval for the exact change, run `--dry-run` first, then `--yes` with
 `--expected-document`. Prefer direct operations over macros; run a macro only
 when the user explicitly asks, because a macro can do anything the Office UI
 can.
+
+Moving whole rows:
+
+There is no curated move-row command, so a row move is a short choreography of
+`com` calls. Describe the whole move as one change when asking for approval.
+Dry-run the first step to validate the sheet reference and row addresses, then
+run the steps in order (each write needs `--yes` and `--expected-document`):
+
+```text
+office com call 'document.Sheets(2).Rows(61).Copy()' --yes --expected-document "MovieLog.xlsx"
+office com call 'document.Sheets(2).Rows(60).Insert(-4107)' --yes --expected-document "MovieLog.xlsx"
+office com set 'CutCopyMode' --root application --value false --yes --expected-document "MovieLog.xlsx"
+office com call 'document.Sheets(2).Rows(62).Delete()' --yes --expected-document "MovieLog.xlsx"
+```
+
+Copy the source row, insert at the destination (the inserted row receives the
+clipboard contents in this build), clear the clipboard, then delete the
+original row. Moving the row up leaves the original one position below the
+insert (delete `source + 1`, as above); moving it down leaves the original at
+the source row (delete `source`). Rules observed on this Office build:
+
+- Copy the whole row with `Rows(n).Copy()`. Copying a narrower range and
+  inserting a whole row is rejected with a "copy area and paste area must not
+  overlap" error.
+- Re-read the rows with fresh expressions after the move. A range object
+  obtained before the move shrinks when its rows are deleted, so reading
+  through it reports too few rows.
+- Read row heights with `Rows(n).RowHeight`, row by row. A multi-row
+  `Range(...).RowHeight` can report None.
+- Delete whole rows with `Rows(n).Delete()`. Range-limited deletes such as
+  `Range("G4:H4").Delete(-4122)` are unreliable.
+- If a step fails mid-move, stop and re-read the affected rows before cleaning
+  up: the sheet may be half-moved, and the intuitive cleanup can delete the
+  wrong row.
 
 Blocked: every member name starting with `save` or `close`, plus `quit` and
 `exit`, is rejected for method calls and property sets (error

@@ -138,6 +138,21 @@ def invoke(
             params=params,
         )
 
+    if operation == "excel.range.sort":
+        _require_app(target, AppKind.EXCEL, operation)
+        address = require_str(params, "address")
+        if "keys" not in params:
+            raise invalid_request("Parameter 'keys' is required.")
+        dry_run = optional_bool(params, "dry_run", False)
+        return excel.sort_range(
+            target,
+            address=address,
+            keys=params.get("keys"),
+            dry_run=dry_run,
+            max_cells=settings.max_cells,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -296,6 +311,38 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                         "note": "Anchor inside the destination or a sheet reference such as 'Sheet2!A1'.",
                     },
                     "screen_tip": {"type": "string", "required": False},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.range.sort",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Sort the rows of an A1-style range in place with a stable multi-key "
+                    "sort (up to 3 keys). Rows are moved as whole rows (values, cell "
+                    "formatting and hyperlinks travel with the row) using Excel row "
+                    "insert/delete moves, because this Excel build ignores Range.Sort calls "
+                    "whose key is a Range object passed through automation. The range must "
+                    "cover every column whose contents should stay aligned; rows outside "
+                    "the range are not touched."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "address": {"type": "string", "required": True},
+                    "keys": {
+                        "type": "array",
+                        "required": True,
+                        "items": "objects",
+                        "note": (
+                            "1 to 3 objects, applied in order (first key is primary). Each "
+                            "has 'column' (a 1-based offset from the range's left edge, or a "
+                            "sheet column letter such as 'C' that lies inside the range) and "
+                            "an optional 'order' ('ascending' default or 'descending')."
+                        ),
+                    },
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},

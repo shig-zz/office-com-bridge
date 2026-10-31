@@ -562,6 +562,75 @@ def excel_range_add_hyperlink(
     _run(ctx, action)
 
 
+@excel_range_app.command("sort")
+def excel_range_sort(
+    ctx: typer.Context,
+    address: str = typer.Argument(
+        ..., help="A1-style range to sort, for example A2:E54 (exclude header rows)."
+    ),
+    column: list[str] = typer.Option(
+        ...,
+        "--column",
+        "-c",
+        help=(
+            "Sort column: a number (1-based from the range's left edge) or a sheet column "
+            "letter such as C. Repeat for up to 3 keys, in priority order."
+        ),
+    ),
+    order: list[str] = typer.Option(
+        (),
+        "--order",
+        "-o",
+        help="ascending or descending for the corresponding key; defaults to ascending.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned row order without changing the sheet."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Sort the rows of an Excel range in place (stable, up to 3 keys)."""
+    if not 1 <= len(column) <= 3:
+        raise typer.BadParameter("Provide between 1 and 3 --column options.")
+    if len(order) > len(column):
+        raise typer.BadParameter("--order appears once per --column, in the same order.")
+    keys: list[dict[str, Any]] = []
+    for index, col in enumerate(column):
+        key: dict[str, Any] = {"column": int(col) if col.isdigit() else col}
+        if index < len(order):
+            key["order"] = order[index].lower()
+        keys.append(key)
+    params: dict[str, Any] = {"address": address, "keys": keys, "dry_run": dry_run}
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"sort the rows of {address} by "
+                    + ", ".join(
+                        f"{key['column']} {key.get('order', 'ascending')}" for key in keys
+                    ),
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("excel.range.sort", params)
+
+    _run(ctx, action)
+
+
 @excel_workbook_app.command("inspect")
 def excel_workbook_inspect(ctx: typer.Context) -> None:
     """Read workbook metadata and worksheet names."""
