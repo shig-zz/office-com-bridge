@@ -214,6 +214,7 @@ office com set 'window.Selection.Font.Bold' --value true
 - `com get EXPR` — read a property (no confirmation). EXPR ends with a property name.
 - `com call EXPR` — call a method (write workflow applies). EXPR ends with `(arguments)`.
 - `com set EXPR --value V` — set a property (write workflow applies). EXPR ends with a property name. V is JSON (`42`, `true`, `"text"`, `[[1,2],[3,4]]`) or a plain string.
+  - A two-dimensional value array for `Value2` (for example `[[1,2],[3,4]]`) is passed to COM as a tuple of tuples (the same shape `excel.range.write` uses), so it lands in the individual cells correctly. Scalars and one-dimensional arrays are passed through unchanged.
 
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
 xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,

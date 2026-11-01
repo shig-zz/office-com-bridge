@@ -29,6 +29,18 @@ from .common import check_expected_document, jsonable, require_confirm, truncate
 MODES = ("get", "call", "set")
 ROOTS = ("application", "window", "document")
 
+
+def _com_value(value: Any) -> Any:
+    """Normalise a value for COM property assignment.
+
+    A two-dimensional array of sequences (list or tuple of list/tuple) is passed to COM as the
+    tuple-of-tuples shape the object model expects (as used by excel.range.write). Scalars,
+    booleans, plain numbers and 1-D value arrays are returned unchanged.
+    """
+    if isinstance(value, (list, tuple)) and value and all(isinstance(row, (list, tuple)) for row in value):
+        return tuple(tuple(row) for row in value)
+    return value
+
 _BLOCKED_PREFIXES = ("save", "close")
 _BLOCKED_NAMES = ("quit", "exit")
 
@@ -156,6 +168,7 @@ def execute(
 
     owner = _walk(root_object, segments[:-1])
     _member(owner, last.name)
+    com_value = _com_value(value)
     if dry_run:
         return {
             "mode": "set",
@@ -163,10 +176,10 @@ def execute(
             "dry_run": True,
             "applied": False,
             "property": last.name,
-            "value": jsonable(value),
+            "value": jsonable(com_value),
         }
     try:
-        setattr(owner, last.name, value)
+        setattr(owner, last.name, com_value)
     except pywintypes.com_error as exc:
         raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
     except Exception as exc:
@@ -177,7 +190,7 @@ def execute(
         "dry_run": False,
         "applied": True,
         "property": last.name,
-        "value": jsonable(value),
+        "value": jsonable(com_value),
     }
 
 

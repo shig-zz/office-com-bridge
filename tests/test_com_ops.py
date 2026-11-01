@@ -184,6 +184,28 @@ def test_set_applies_when_confirmed() -> None:
     assert font.sets == {"Bold": True}
 
 
+def test_set_value2_2d_array_is_passed_as_tuple_of_tuples() -> None:
+    range_node = Node("range", {"Value2": None})
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("A1:B2").Value2', target, value=[[1, 2], [3, 4]], confirm=True)
+    assert result["applied"] is True
+    assert result["dry_run"] is False
+    assert result["value"] == [[1, 2], [3, 4]]
+    assert range_node.sets == {"Value2": ((1, 2), (3, 4))}
+
+
+def test_set_value2_1d_array_is_passed_unchanged() -> None:
+    range_node = Node("range", {"Value2": None})
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("A1:B1").Value2', target, value=[5, 6], confirm=True)
+    assert result["applied"] is True
+    assert range_node.sets == {"Value2": [5, 6]}
+
+
 def test_set_single_segment_uses_root_directly() -> None:
     document = Node("document", {"ReadOnly": False})
     target = make_target(document=document)
