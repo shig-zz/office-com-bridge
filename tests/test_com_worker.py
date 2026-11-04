@@ -268,6 +268,22 @@ def test_inspect_expired_target_id_fails_without_switch(core, monkeypatch) -> No
     assert core._registry.get(a["target_id"]).state.value == "expired"  # noqa: SLF001
 
 
+def test_operation_errors_carry_the_used_target_id(core, monkeypatch) -> None:
+    a = capture(core, monkeypatch, 1000)["target"]
+    # expected_document checked against the explicitly routed target, not the
+    # selected one: asking for a Word range on an Excel document fails cleanly
+    # and names the target that was used.
+    with pytest.raises(BridgeError) as excinfo:
+        core.invoke(
+            "word.selection.insert_text",
+            {"text": "x", "confirm": True, "expected_document": "Nope.docx"},
+            a["target_id"],
+        )
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+    assert excinfo.value.details["target_id"] == a["target_id"]
+    assert excinfo.value.details["application"] == "Excel"
+
+
 def test_selection_is_validated_on_explicit_operations(core, monkeypatch) -> None:
     # Even with an explicit target_id, an unrelated dead *selected* target must
     # not break the request (routing is per request, not global state).
@@ -280,3 +296,66 @@ def test_selection_is_validated_on_explicit_operations(core, monkeypatch) -> Non
     result, summary = core.inspect("excel.workbook", {}, b["target_id"])
     assert summary is not None and summary["target_id"] == b["target_id"]
     assert result["name"] == "Book2.xlsx"
+
+def test_com_error_is_translated_and_worker_keeps_running(core, monkeypatch) -> None:
+    import pywintypes
+
+    from office_bridge.operations import registry as ops_registry
+
+    state = {"fail": True}
+    real_inspect = ops_registry.inspect
+
+    def flaky_inspect(target, kind, params, settings):
+        if state["fail"]:
+            raise pywintypes.com_error(
+                -2147352567,
+                "Excel rejected the call",
+                (0, None, None, None, None, -2146827284),
+                None,
+            )
+        return real_inspect(target, kind, params, settings)
+
+    monkeypatch.setattr(com_worker.registry, "inspect", flaky_inspect)
+    capture(core, monkeypatch, 1000)
+
+    with pytest.raises(BridgeError) as excinfo:
+        core.inspect("excel.workbook", {})
+    assert excinfo.value.code == ErrorCode.COM_ERROR
+
+    # The target stays registered and usable after a COM error.
+    state["fail"] = False
+    result, summary = core.inspect("excel.workbook", {})
+    assert summary is not None
+    assert result["name"] == "Book1.xlsx"
+
+
+def test_busy_hresult_maps_to_office_busy(core, monkeypatch) -> None:
+    import pywintypes
+
+    def busy_inspect(target, kind, params, settings):
+        raise pywintypes.com_error(0x8001010A, "busy", None, None)
+
+    monkeypatch.setattr(com_worker.registry, "inspect", busy_inspect)
+    capture(core, monkeypatch, 1000)
+    with pytest.raises(BridgeError) as excinfo:
+        core.inspect("excel.workbook", {})
+    assert excinfo.value.code == ErrorCode.OFFICE_BUSY
+
+
+def test_serial_operations_across_two_targets_keep_records(core, monkeypatch) -> None:
+    a = capture(core, monkeypatch, 1000)["target"]
+    b = capture(
+        core, monkeypatch, 2000, document="Book2.xlsx", full_name=r"C:\docs\Book2.xlsx"
+    )["target"]
+    for target_id, expect in (
+        (a["target_id"], "Book1.xlsx"),
+        (b["target_id"], "Book2.xlsx"),
+        (a["target_id"], "Book1.xlsx"),
+        (b["target_id"], "Book2.xlsx"),
+    ):
+        result, summary = core.inspect("excel.workbook", {}, target_id)
+        assert result["name"] == expect
+        assert summary["target_id"] == target_id
+    # Records kept both documents; selection untouched.
+    assert [r.display_name for r in core._registry.records()] == ["Book1.xlsx", "Book2.xlsx"]  # noqa: SLF001
+    assert core._registry.selected_target_id == b["target_id"]  # noqa: SLF001

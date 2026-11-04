@@ -584,6 +584,8 @@ class BridgeCore:
                 result = {"target": summary, **result}
             return result, summary
         except BridgeError as exc:
+            if used_id is not None and exc.status_code < 500:
+                exc.details = {**(exc.details or {}), "target_id": used_id}
             logger.warning(
                 "operation=%s target=%s/%s id=%s result=error code=%s",
                 operation,

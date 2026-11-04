@@ -54,6 +54,7 @@ app.add_typer(target_app, name="target")
 class ClientOptions:
     url: str
     timeout: float
+    target: str | None = None
 
 
 class BridgeUnreachable(Exception):
@@ -61,9 +62,15 @@ class BridgeUnreachable(Exception):
 
 
 class BridgeClient:
-    def __init__(self, base_url: str, timeout: float) -> None:
+    def __init__(self, base_url: str, timeout: float, target_id: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.target_id = target_id
+
+    def _with_target(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.target_id:
+            payload = {**payload, "target_id": self.target_id}
+        return payload
 
     def request(
         self,
@@ -114,10 +121,14 @@ class BridgeClient:
         return self.request("DELETE", f"/targets/{target_id}")
 
     def inspect(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.request("POST", "/inspect", {"kind": kind, "params": params or {}})
+        return self.request(
+            "POST", "/inspect", self._with_target({"kind": kind, "params": params or {}})
+        )
 
     def invoke(self, operation: str, params: dict[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/invoke", {"operation": operation, "params": params})
+        return self.request(
+            "POST", "/invoke", self._with_target({"operation": operation, "params": params})
+        )
 
     def set_property(
         self,
@@ -129,7 +140,7 @@ class BridgeClient:
         payload: dict[str, Any] = {"property": name, "value": value, "confirm": confirm}
         if expected_document:
             payload["expected_document"] = expected_document
-        return self.request("POST", "/set-property", payload)
+        return self.request("POST", "/set-property", self._with_target(payload))
 
     def com(
         self,
@@ -152,7 +163,7 @@ class BridgeClient:
             payload["value"] = value
         if expected_document:
             payload["expected_document"] = expected_document
-        return self.request("POST", "/com", payload)
+        return self.request("POST", "/com", self._with_target(payload))
 
 
 def _default_url() -> str:
@@ -178,8 +189,17 @@ def configure(
         envvar="OFFICE_BRIDGE_CLI_TIMEOUT",
         help="HTTP timeout in seconds.",
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        envvar="OFFICE_BRIDGE_TARGET",
+        help=(
+            "Target id (from 'office target list') that this command operates on. "
+            "Omit to use the last captured target."
+        ),
+    ),
 ) -> None:
-    ctx.obj = ClientOptions(url=url or _default_url(), timeout=timeout)
+    ctx.obj = ClientOptions(url=url or _default_url(), timeout=timeout, target=target)
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -188,7 +208,7 @@ def _emit(payload: dict[str, Any]) -> None:
 
 def _run(ctx: typer.Context, action: Callable[[BridgeClient], dict[str, Any]]) -> None:
     options: ClientOptions = ctx.obj
-    client = BridgeClient(options.url, options.timeout)
+    client = BridgeClient(options.url, options.timeout, options.target)
     try:
         payload = action(client)
     except BridgeUnreachable as exc:
@@ -266,16 +286,46 @@ def _confirm_write(
     action_description: str,
     expected_document: str | None,
 ) -> bool:
-    context_response = client.context()
-    if not context_response.get("ok"):
-        _emit(context_response)
-        raise typer.Exit(1)
-    result = context_response.get("result") or {}
-    actual_document = result.get("document", "")
-    actual_application = result.get("application", "")
+    options: ClientOptions = ctx.obj
+    if options.target:
+        response = client.target_info(options.target)
+        if not response.get("ok"):
+            _emit(response)
+            raise typer.Exit(1)
+        record = response.get("result") or {}
+        if record.get("state") != "active":
+            typer.echo(
+                f"Target {options.target} is {record.get('state')} "
+                f"({record.get('expired_reason') or 'unavailable'}); refusing to write.",
+                err=True,
+            )
+            return False
+        actual_document = str(record.get("display_name", ""))
+        actual_application = str(record.get("app_type", ""))
+        actual_full_name = str((record.get("metadata") or {}).get("full_name", ""))
+        label = f"{options.target} ({actual_application} / {actual_document})"
+    else:
+        context_response = client.context()
+        if not context_response.get("ok"):
+            _emit(context_response)
+            raise typer.Exit(1)
+        result = context_response.get("result") or {}
+        actual_document = str(result.get("document", ""))
+        actual_application = str(result.get("application", ""))
+        actual_full_name = str(result.get("full_name", ""))
+        label = f"last selected target (no --target): {actual_application} / {actual_document}"
+        listing = client.targets()
+        targets = (listing.get("result") or {}).get("targets") or []
+        active = [entry for entry in targets if entry.get("state") == "active"]
+        if len(active) > 1:
+            typer.echo(
+                f"Warning: {len(active)} targets are registered; pass --target to be "
+                "explicit about the write destination.",
+                err=True,
+            )
     if expected_document and expected_document.lower() not in {
-        str(actual_document).lower(),
-        str(result.get("full_name", "")).lower(),
+        actual_document.lower(),
+        actual_full_name.lower(),
     }:
         typer.echo(
             f"Target mismatch: expected {expected_document!r}, bridge is attached to "
@@ -284,7 +334,7 @@ def _confirm_write(
         )
         return False
     typer.echo(
-        f"Target: {actual_application} / {actual_document}\nAction: {action_description}",
+        f"Target: {label}\nAction: {action_description}",
         err=True,
     )
     return typer.confirm("Proceed with this change?", default=False)

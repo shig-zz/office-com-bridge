@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -38,6 +39,7 @@ class FakeClient:
         self.capture_calls: list[Any] = []
         self.info_calls: list[str] = []
         self.remove_calls: list[str] = []
+        self.target_id: str | None = None
 
     def health(self):
         return self._health
@@ -72,7 +74,16 @@ class FakeClient:
 
     def target_info(self, target_id):
         self.info_calls.append(target_id)
-        return {"ok": True, "result": {"target_id": target_id}}
+        return {
+            "ok": True,
+            "result": {
+                "target_id": target_id,
+                "state": "active",
+                "app_type": "excel",
+                "display_name": "Book1.xlsx",
+                "metadata": {"full_name": r"C:\docs\Book1.xlsx"},
+            },
+        }
 
     def remove_target(self, target_id):
         self.remove_calls.append(target_id)
@@ -80,7 +91,11 @@ class FakeClient:
 
 
 def install_client(monkeypatch, client: FakeClient) -> None:
-    monkeypatch.setattr(cli, "BridgeClient", lambda url, timeout: client)
+    def factory(url, timeout, target_id=None):
+        client.target_id = target_id
+        return client
+
+    monkeypatch.setattr(cli, "BridgeClient", factory)
 
 
 def parse_stdout(result) -> dict[str, Any]:
@@ -416,3 +431,91 @@ def test_target_info_and_remove_pass_ids_through(monkeypatch) -> None:
     result = CliRunner().invoke(cli.app, ["target", "remove", "t-bbbb2222bbbb"])
     assert result.exit_code == 0
     assert client.remove_calls == ["t-bbbb2222bbbb"]
+
+def test_target_option_stored_on_client(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["--target", "t-abc123", "inspect", "selection"])
+    assert result.exit_code == 0
+    assert client.target_id == "t-abc123"
+
+
+def test_target_option_reads_env_var(monkeypatch) -> None:
+    monkeypatch.setenv("OFFICE_BRIDGE_TARGET", "t-env")
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["health"])
+    assert result.exit_code == 0
+    assert client.target_id == "t-env"
+
+
+def test_bridge_client_injects_target_into_payloads(monkeypatch) -> None:
+    captured: list[tuple[str, str, dict]] = []
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    class FakeHttp:
+        def __init__(self, base_url, timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, method, path, json=None):
+            captured.append((method, path, json))
+            return Resp()
+
+    monkeypatch.setattr(cli.httpx, "Client", FakeHttp)
+    client = cli.BridgeClient("http://127.0.0.1:1", 1.0, target_id="t-999999999999")
+    client.inspect("selection", {})
+    client.invoke("excel.range.write", {"address": "A1"})
+    client.set_property("excel.active_sheet", "Sheet2", True, None)
+    client.com("get", "window", "Name", None, False, False, None)
+
+    assert [path for _m, path, _p in captured] == [
+        "/inspect",
+        "/invoke",
+        "/set-property",
+        "/com",
+    ]
+    for _method, path, payload in captured:
+        assert payload["target_id"] == "t-999999999999", path
+
+
+def test_confirm_write_uses_target_record(monkeypatch) -> None:
+    client = FakeClient()
+    ctx = SimpleNamespace(obj=cli.ClientOptions(url="u", timeout=1.0, target="t-aaaa1111aaaa"))
+    prompts: list = []
+    monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: prompts.append(args) or True)
+    assert cli._confirm_write(ctx, client, "write A1:B2", "Book1.xlsx") is True
+    assert client.info_calls == ["t-aaaa1111aaaa"]
+    assert prompts  # the operator was prompted once
+
+
+def test_confirm_write_refuses_expired_target(monkeypatch) -> None:
+    client = FakeClient()
+    client.target_info = lambda target_id: {
+        "ok": True,
+        "result": {"target_id": target_id, "state": "expired", "expired_reason": "closed"},
+    }
+    ctx = SimpleNamespace(obj=cli.ClientOptions(url="u", timeout=1.0, target="t-aaaa1111aaaa"))
+    monkeypatch.setattr(
+        cli.typer, "confirm", lambda *args, **kwargs: pytest.fail("must not prompt")
+    )
+    assert cli._confirm_write(ctx, client, "write A1:B2", None) is False
+
+
+def test_confirm_write_target_mismatch_refuses(monkeypatch) -> None:
+    client = FakeClient()
+    ctx = SimpleNamespace(obj=cli.ClientOptions(url="u", timeout=1.0, target="t-aaaa1111aaaa"))
+    monkeypatch.setattr(
+        cli.typer, "confirm", lambda *args, **kwargs: pytest.fail("must not prompt")
+    )
+    assert cli._confirm_write(ctx, client, "write A1:B2", "Other.xlsx") is False
