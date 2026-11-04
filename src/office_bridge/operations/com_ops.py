@@ -23,11 +23,14 @@ from ..errors import (
     invalid_request,
     operation_blocked,
 )
-from ..target import ResolvedTarget
+from ..target import AppKind, ResolvedTarget
 from .common import check_expected_document, jsonable, require_confirm, truncate_text
 
 MODES = ("get", "call", "set")
 ROOTS = ("application", "window", "document")
+
+# Methods whose first two arguments are Before/After sheet references.
+_SHEET_PLACEMENT_METHODS = {"add", "copy", "move"}
 
 
 def _com_value(value: Any) -> Any:
@@ -142,12 +145,13 @@ def execute(
         require_confirm(params, f"com.{mode}")
 
     if mode == "call":
+        owner = _walk(root_object, segments[:-1])
+        member = _member(owner, last.name)
+        if not callable(member):
+            raise invalid_request(f"Member {last.name!r} is not a method.")
+        call_args, resolved_notes = _resolve_placement_arguments(target, owner, last)
         if dry_run:
-            owner = _walk(root_object, segments[:-1])
-            member = _member(owner, last.name)
-            if not callable(member):
-                raise invalid_request(f"Member {last.name!r} is not a method.")
-            return {
+            preview = {
                 "mode": "call",
                 "root": root,
                 "dry_run": True,
@@ -155,8 +159,11 @@ def execute(
                 "method": last.name,
                 "arguments": [jsonable(item) for item in last_args],
             }
-        result = _walk(root_object, segments)
-        return {
+            if resolved_notes:
+                preview["resolved_arguments"] = resolved_notes
+            return preview
+        result = _call(member, Segment(name=last.name, args=call_args))
+        payload = {
             "mode": "call",
             "root": root,
             "dry_run": False,
@@ -165,6 +172,9 @@ def execute(
             "arguments": [jsonable(item) for item in last_args],
             "result": jsonable(result),
         }
+        if resolved_notes:
+            payload["resolved_arguments"] = resolved_notes
+        return payload
 
     owner = _walk(root_object, segments[:-1])
     _member(owner, last.name)
@@ -284,3 +294,59 @@ def _unknown_member(name: str, exc: BaseException) -> BridgeError:
         f"Member {name!r} was not found on the target object.",
         {"member": name, "error": str(exc)},
     )
+
+
+def _placement_sheets(owner: Any) -> Any | None:
+    """Return the workbook's Worksheets collection when the call owner lives in one.
+
+    A Worksheet (Copy/Move) and a Worksheets collection (Add) both expose a
+    parent workbook. Ranges expose a Worksheet parent, which has no
+    Worksheets member, so they are excluded.
+    """
+    try:
+        sheets = owner.Parent.Worksheets
+        sheets.Count
+    except Exception:
+        return None
+    return sheets
+
+
+def _resolve_placement_arguments(
+    target: ResolvedTarget, owner: Any, last: Segment
+) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+    """Resolve Add/Copy/Move Before/After literals into real sheet objects.
+
+    Excel's Before/After parameters are Variants that must wrap an actual
+    Worksheet object; a raw sheet index or sheet name passed through COM is
+    rejected. Because the bridge holds the owning workbook during the walk,
+    an int (1-based sheet index) or a sheet-name string in the first two
+    argument positions is resolved to the live sheet object before the call.
+    Unresolvable values are passed through unchanged so Excel reports the
+    failure.
+    """
+    args = last.args if last.args is not None else ()
+    if target.app is not AppKind.EXCEL or last.name.lower() not in _SHEET_PLACEMENT_METHODS:
+        return args, []
+    sheets = _placement_sheets(owner)
+    if sheets is None:
+        return args, []
+    resolved: list[Any] = []
+    notes: list[dict[str, Any]] = []
+    for position, arg in enumerate(args):
+        sheet: Any = None
+        if position < 2 and isinstance(arg, (int, str)) and not isinstance(arg, bool):
+            try:
+                if not isinstance(arg, int) or 1 <= arg <= sheets.Count:
+                    sheet = sheets(arg)
+            except Exception:
+                sheet = None
+        if sheet is None:
+            resolved.append(arg)
+            continue
+        resolved.append(sheet)
+        try:
+            sheet_name = jsonable(sheet.Name)
+        except Exception:
+            sheet_name = None
+        notes.append({"position": position, "argument": jsonable(arg), "sheet": sheet_name})
+    return tuple(resolved), notes

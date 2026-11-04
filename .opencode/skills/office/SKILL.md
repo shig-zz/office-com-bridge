@@ -157,7 +157,8 @@ office excel range add-hyperlink "E35" --url "https://example.com/" --yes --expe
   `Sheet2!A1`); `--screen-tip` sets the tooltip.
 - Do not try to create hyperlinks through `office com`: `Hyperlinks.Add` needs
   the range object itself as an argument, and general `call` arguments are
-  literals only.
+  literals only (the sheet placement arguments of `Add`/`Copy`/`Move` are the
+  one resolved exception — see "General operations").
 
 Excel row sorting:
 
@@ -219,6 +220,30 @@ office com set 'window.Selection.Font.Bold' --value true
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
 xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,
 ppLayoutText = 2).
+
+Excel sheet placement arguments (Before/After of `Add`, `Copy`, `Move`):
+In the COM object model these parameters must be Variants wrapping an actual
+Worksheet object; a raw sheet index or sheet-name string is rejected by Excel
+itself (Excel error 1004 wrapped in `DISP_E_EXCEPTION`). The bridge resolves the
+first two literal arguments of `Add`, `Copy`, and `Move` against the workbook
+owning the object: an int is a 1-based sheet index, a string is a sheet name,
+and `null` means the argument is omitted. Resolved sheets are reported as
+`resolved_arguments` in dry-run previews and in executed calls. Values that do
+not resolve are passed through unchanged, so Excel still reports the failure.
+
+```text
+office com call 'document.Worksheets.Add(null, 7)' --dry-run --expected-document "Budget.xlsx"
+office com call 'document.Sheets(8).Copy(null, 8)' --yes --expected-document "Budget.xlsx"
+office com call 'document.Sheets(9).Move("Sheet2")' --yes --expected-document "Budget.xlsx"
+```
+
+- `Copy(null, index)` appends a copy of a sheet after the last sheet;
+  `Move(index)` reorders sheets. Re-read `office excel workbook inspect` after
+  every placement call: sheet indices shift, and a `Delete()` aimed at a stale
+  index removes the wrong sheet.
+- `Copy()` and `Move()` with no arguments follow Excel's documented behavior and
+  create a new scratch workbook; ask the user to close it without saving.
+
 Check `office capabilities` for the exact syntax and current limits.
 
 The same write workflow applies: confirm the target with `office context`, get

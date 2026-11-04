@@ -379,3 +379,89 @@ def test_blocked_summary_lists_prefixes_and_names() -> None:
 def test_modes_and_roots_are_exported() -> None:
     assert com_ops.MODES == ("get", "call", "set")
     assert com_ops.ROOTS == ("application", "window", "document")
+
+
+class SheetsNode(Node):
+    """Callable collection fake: Item-style arguments resolve to sheet nodes."""
+
+    def __init__(self, items: dict[Any, Any], count: int) -> None:
+        super().__init__("Sheets", {"Count": count})
+        object.__setattr__(self, "_items", dict(items))
+
+    def __call__(self, *args: Any) -> Any:
+        self.calls.append(args)
+        if args and args[0] in self._items:
+            return self._items[args[0]]
+        raise KeyError(args)
+
+
+def make_workbook_target(*, app: AppKind = AppKind.EXCEL) -> tuple[SimpleNamespace, dict[str, Any]]:
+    copy_node = Node("Copy", call_result="copied")
+    move_node = Node("Move")
+    add_node = Node("Add", call_result="added")
+    sheet7 = Node("s7", {"Name": "2026年10月", "Copy": copy_node, "Move": move_node})
+    sheet8 = Node("s8", {"Name": "2026年11月", "Copy": Node("Copy"), "Move": Node("Move")})
+    sheets = SheetsNode({7: sheet7, 8: sheet8, "2026年11月": sheet8}, count=8)
+    workbook = Node("Workbook", {"Name": "Book1.xlsx", "Worksheets": sheets})
+    for node in (sheet7, sheet8, sheets):
+        node.__dict__["_members"]["Parent"] = workbook
+    sheets.__dict__["_members"]["Add"] = add_node
+    document = Node("document", {"Name": "Book1.xlsx", "Sheets": sheets, "Worksheets": sheets})
+    target = make_target(document=document)
+    if app is not AppKind.EXCEL:
+        target.app = app
+    nodes = {"sheet7": sheet7, "sheet8": sheet8, "copy": copy_node, "move": move_node, "add": add_node}
+    return target, nodes
+
+
+def test_call_copy_before_index_resolves_sheet_object() -> None:
+    target, nodes = make_workbook_target()
+    result = run("call", "document.Sheets(7).Copy(8)", target, root="document", confirm=True)
+    assert nodes["copy"].calls == [(nodes["sheet8"],)]
+    assert result["resolved_arguments"] == [{"position": 0, "argument": 8, "sheet": "2026年11月"}]
+
+
+def test_call_move_by_sheet_name_resolves_sheet_object() -> None:
+    target, nodes = make_workbook_target()
+    result = run("call", 'document.Sheets(7).Move("2026年11月")', target, root="document", confirm=True)
+    assert nodes["move"].calls == [(nodes["sheet8"],)]
+    assert result["resolved_arguments"][0]["sheet"] == "2026年11月"
+
+
+def test_call_add_after_index_resolves_with_null_placeholder() -> None:
+    target, nodes = make_workbook_target()
+    result = run("call", "document.Worksheets.Add(null, 8)", target, root="document", confirm=True)
+    assert nodes["add"].calls == [(None, nodes["sheet8"])]
+    assert result["resolved_arguments"] == [{"position": 1, "argument": 8, "sheet": "2026年11月"}]
+
+
+def test_call_placement_index_out_of_range_passes_through() -> None:
+    target, nodes = make_workbook_target()
+    result = run("call", "document.Sheets(7).Copy(99)", target, root="document", confirm=True)
+    assert nodes["copy"].calls == [(99,)]
+    assert "resolved_arguments" not in result
+
+
+def test_call_range_copy_destination_is_not_resolved() -> None:
+    target, _ = make_workbook_target()
+    worksheet = Node("Worksheet", {"Name": "Sheet1"})
+    rng_copy = Node("Copy", call_result="ok")
+    cell = Node("Range", {"Parent": worksheet, "Copy": rng_copy})
+    target.document.__dict__["_members"]["Range"] = Node("RangeMember", call_result=cell)
+    result = run("call", 'document.Range("A1").Copy("B1")', target, root="document", confirm=True)
+    assert rng_copy.calls == [("B1",)]
+    assert "resolved_arguments" not in result
+
+
+def test_call_placement_resolution_requires_excel() -> None:
+    target, nodes = make_workbook_target(app=AppKind.WORD)
+    result = run("call", "document.Sheets(7).Copy(8)", target, root="document", confirm=True)
+    assert nodes["copy"].calls == [(8,)]
+    assert "resolved_arguments" not in result
+
+
+def test_call_dry_run_previews_resolved_arguments() -> None:
+    target, nodes = make_workbook_target()
+    result = run("call", "document.Sheets(7).Copy(8)", target, root="document", dry_run=True)
+    assert nodes["copy"].calls == []
+    assert result["resolved_arguments"] == [{"position": 0, "argument": 8, "sheet": "2026年11月"}]
