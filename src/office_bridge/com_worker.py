@@ -353,32 +353,56 @@ class BridgeCore:
         self._refresh_caches()
         return info
 
-    def inspect(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    def inspect(
+        self,
+        kind: str,
+        params: dict[str, Any],
+        target_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self.worker.call(
             self._inspect,
             kind,
             params,
+            target_id,
             timeout=self.settings.request_timeout,
         )
 
-    def _inspect(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _inspect(
+        self,
+        kind: str,
+        params: dict[str, Any],
+        target_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self._execute(
             f"inspect:{kind}",
             lambda target: registry.inspect(target, kind, params, self.settings),
+            target_id,
         )
 
-    def invoke(self, operation: str, params: dict[str, Any]) -> dict[str, Any]:
+    def invoke(
+        self,
+        operation: str,
+        params: dict[str, Any],
+        target_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self.worker.call(
             self._invoke,
             operation,
             params,
+            target_id,
             timeout=self.settings.write_timeout,
         )
 
-    def _invoke(self, operation: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _invoke(
+        self,
+        operation: str,
+        params: dict[str, Any],
+        target_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self._execute(
             operation,
             lambda target: registry.invoke(target, operation, params, self.settings),
+            target_id,
         )
 
     def set_property(
@@ -386,21 +410,30 @@ class BridgeCore:
         name: str,
         value: Any,
         params: dict[str, Any],
-    ) -> dict[str, Any]:
+        target_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self.worker.call(
             self._set_property,
             name,
             value,
             params,
+            target_id,
             timeout=self.settings.write_timeout,
         )
 
-    def _set_property(self, name: str, value: Any, params: dict[str, Any]) -> dict[str, Any]:
+    def _set_property(
+        self,
+        name: str,
+        value: Any,
+        params: dict[str, Any],
+        target_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self._execute(
             f"set-property:{name}",
             lambda target: registry.set_property(
                 target, name, value, params, self.settings
             ),
+            target_id,
         )
 
     def capabilities(self) -> dict[str, Any]:
@@ -414,7 +447,8 @@ class BridgeCore:
         value: Any,
         dry_run: bool,
         params: dict[str, Any],
-    ) -> dict[str, Any]:
+        target_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if mode not in com_ops.MODES:
             raise invalid_request(
                 f"Mode must be one of: {', '.join(com_ops.MODES)}.",
@@ -430,6 +464,7 @@ class BridgeCore:
             value,
             dry_run,
             params,
+            target_id,
             timeout=timeout,
         )
 
@@ -441,12 +476,14 @@ class BridgeCore:
         value: Any,
         dry_run: bool,
         params: dict[str, Any],
-    ) -> dict[str, Any]:
+        target_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         return self._execute(
             f"com.{mode}",
             lambda target: com_ops.execute(
                 target, mode, root, segments, value, dry_run, params, self.settings
             ),
+            target_id,
         )
 
     def _require_target(self) -> ResolvedTarget:
@@ -492,46 +529,86 @@ class BridgeCore:
             app_metadata=_app_metadata(info),
         )
 
+    def _resolve_target(
+        self, target_id: str | None
+    ) -> tuple[ResolvedTarget, str | None]:
+        """Resolve the target for a request; never falls back to another one."""
+        if target_id is not None:
+            record = self._registry.get(target_id)
+            if record is None:
+                raise target_not_found(target_id)
+            if record.state is not TargetState.ACTIVE:
+                raise target_lost(
+                    details={
+                        "target_id": target_id,
+                        "reason": record.expired_reason or "expired",
+                    }
+                )
+            resolved = self._com_refs.get(target_id)
+            if resolved is None or not resolved.is_alive():
+                self._expire_target(target_id, "com_reference_lost")
+                raise target_lost(
+                    details={"target_id": target_id, "reason": "com_reference_lost"}
+                )
+            return resolved, target_id
+        if self._registry.selected_target_id is None:
+            raise target_not_set()
+        resolved = self._require_target()
+        return resolved, self._registry.selected_target_id
+
+    def _summary_for(self, target_id: str | None) -> dict[str, Any] | None:
+        if target_id is None:
+            return None
+        record = self._registry.get(target_id)
+        if record is None:
+            return None
+        return record.summary()
+
     def _execute(
         self,
         operation: str,
         function: Callable[[ResolvedTarget], T],
-    ) -> T:
-        target = self._require_target()
-        target_id = self._registry.selected_target_id
+        target_id: str | None = None,
+    ) -> tuple[T, dict[str, Any] | None]:
+        target, used_id = self._resolve_target(target_id)
         started = time.perf_counter()
         success = False
         try:
             result = function(target)
             success = True
-            if target_id is not None:
-                self._sync_record(target_id, target.info)
+            if used_id is not None:
+                self._sync_record(used_id, target.info)
             self._refresh_caches()
-            return result
+            summary = self._summary_for(used_id)
+            if isinstance(result, dict):
+                result = {"target": summary, **result}
+            return result, summary
         except BridgeError as exc:
             logger.warning(
-                "operation=%s target=%s/%s result=error code=%s",
+                "operation=%s target=%s/%s id=%s result=error code=%s",
                 operation,
                 target.info.get("application"),
                 target.info.get("document"),
+                used_id,
                 exc.code,
             )
             raise
         except BaseException as exc:
             if not target.is_alive():
-                if target_id is not None:
-                    self._expire_target(target_id, "com_reference_lost")
+                if used_id is not None:
+                    self._expire_target(used_id, "com_reference_lost")
                 raise target_lost(
-                    details={"target_id": target_id, "reason": "com_reference_lost"}
+                    details={"target_id": used_id, "reason": "com_reference_lost"}
                 ) from exc
             if isinstance(exc, pywintypes.com_error):
                 hresult = int(getattr(exc, "hresult", 0) or 0) & 0xFFFFFFFF
                 if hresult in _BUSY_HRESULTS:
                     logger.warning(
-                        "operation=%s target=%s/%s result=busy hresult=0x%08X",
+                        "operation=%s target=%s/%s id=%s result=busy hresult=0x%08X",
                         operation,
                         target.info.get("application"),
                         target.info.get("document"),
+                        used_id,
                         hresult,
                     )
                     raise office_busy(
@@ -539,10 +616,11 @@ class BridgeCore:
                         exc,
                     ) from exc
                 logger.warning(
-                    "operation=%s target=%s/%s result=com_error hresult=0x%08X",
+                    "operation=%s target=%s/%s id=%s result=com_error hresult=0x%08X",
                     operation,
                     target.info.get("application"),
                     target.info.get("document"),
+                    used_id,
                     hresult,
                 )
                 raise com_error("The Office COM call failed.", exc) from exc
@@ -554,10 +632,11 @@ class BridgeCore:
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
             logger.info(
-                "operation=%s target=%s/%s ok=%s duration_ms=%.1f",
+                "operation=%s target=%s/%s id=%s ok=%s duration_ms=%.1f",
                 operation,
                 target.info.get("application"),
                 target.info.get("document"),
+                used_id,
                 success,
                 duration_ms,
             )

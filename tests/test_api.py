@@ -18,8 +18,10 @@ class FakeCore:
     def __init__(self) -> None:
         self.worker = FakeWorker()
         self.summary = {"application": "Excel", "document": "Book1.xlsx"}
-        self.set_calls: list[tuple[str, Any, dict[str, Any]]] = []
-        self.com_calls: list[tuple[str, str, str, Any, bool, dict[str, Any]]] = []
+        self.set_calls: list[tuple[str, Any, dict[str, Any], str | None]] = []
+        self.com_calls: list[tuple[str, str, str, Any, bool, dict[str, Any], str | None]] = []
+        self.inspect_calls: list[tuple[str, dict[str, Any], str | None]] = []
+        self.invoke_calls: list[tuple[str, dict[str, Any], str | None]] = []
         self.capture_calls: list[int | None] = []
 
     def cached_summary(self):
@@ -35,19 +37,27 @@ class FakeCore:
     def capabilities(self):
         return {"inspections": [{"name": "selection"}], "operations": []}
 
-    def inspect(self, kind: str, params: dict[str, Any]):
+    def inspect(self, kind: str, params: dict[str, Any], target_id: str | None = None):
+        self.inspect_calls.append((kind, params, target_id))
         if kind == "missing":
             raise BridgeError(ErrorCode.TARGET_LOST, "gone", 409)
-        return {"kind": kind, "params": params}
+        return {"kind": kind, "params": params}, dict(self.summary)
 
-    def invoke(self, operation: str, params: dict[str, Any]):
+    def invoke(self, operation: str, params: dict[str, Any], target_id: str | None = None):
+        self.invoke_calls.append((operation, params, target_id))
         if operation == "denied":
             raise BridgeError(ErrorCode.UNSUPPORTED_OPERATION, "denied", 400)
-        return {"operation": operation, "params": params}
+        return {"operation": operation, "params": params}, dict(self.summary)
 
-    def set_property(self, name: str, value: Any, params: dict[str, Any]):
-        self.set_calls.append((name, value, params))
-        return {"property": name, "value": value}
+    def set_property(
+        self,
+        name: str,
+        value: Any,
+        params: dict[str, Any],
+        target_id: str | None = None,
+    ):
+        self.set_calls.append((name, value, params, target_id))
+        return {"property": name, "value": value}, dict(self.summary)
 
     def com(
         self,
@@ -57,9 +67,12 @@ class FakeCore:
         value: Any,
         dry_run: bool,
         params: dict[str, Any],
+        target_id: str | None = None,
     ):
-        self.com_calls.append((mode, root, expression, value, dry_run, params))
-        return {"mode": mode, "root": root, "expression": expression}
+        self.com_calls.append(
+            (mode, root, expression, value, dry_run, params, target_id)
+        )
+        return {"mode": mode, "root": root, "expression": expression}, dict(self.summary)
 
     def cached_targets(self):
         return [dict(self.summary)]
@@ -185,6 +198,7 @@ def test_set_property_passes_confirm_and_expected_document() -> None:
             "excel.active_sheet",
             "Sheet2",
             {"confirm": True, "expected_document": "Book1.xlsx"},
+            None,
         )
     ]
 
@@ -215,6 +229,7 @@ def test_com_passes_mode_root_expression_and_flags() -> None:
             "hello",
             True,
             {"confirm": False, "expected_document": "Book1.xlsx"},
+            None,
         )
     ]
 
@@ -274,3 +289,47 @@ def test_remove_target(client: TestClient) -> None:
     response = client.delete("/targets/t-missing00000")
     assert response.status_code == 404
     assert response.json()["error"]["code"] == ErrorCode.TARGET_NOT_FOUND
+
+
+def test_operations_pass_target_id_to_core() -> None:
+    core = FakeCore()
+    client = TestClient(create_app(core, Settings()))
+
+    response = client.post(
+        "/inspect",
+        json={"kind": "excel.range", "params": {"address": "A1"}, "target_id": "t-84102044b1b6"},
+    )
+    assert response.status_code == 200
+    assert core.inspect_calls[-1] == ("excel.range", {"address": "A1"}, "t-84102044b1b6")
+    # The envelope context is the summary of the target the operation used.
+    assert response.json()["context"]["document"] == "Book1.xlsx"
+
+    response = client.post(
+        "/invoke",
+        json={
+            "operation": "excel.range.write",
+            "params": {"address": "A1", "values": [[1]]},
+            "target_id": "t-write0000000",
+        },
+    )
+    assert response.status_code == 200
+    assert core.invoke_calls[-1][2] == "t-write0000000"
+
+    response = client.post(
+        "/com",
+        json={"mode": "get", "expression": "Name", "target_id": "t-read00000000"},
+    )
+    assert response.status_code == 200
+    assert core.com_calls[-1][6] == "t-read00000000"
+
+    response = client.post(
+        "/set-property",
+        json={
+            "property": "excel.active_sheet",
+            "value": "Sheet2",
+            "confirm": True,
+            "target_id": "t-prop00000000",
+        },
+    )
+    assert response.status_code == 200
+    assert core.set_calls[-1][3] == "t-prop00000000"

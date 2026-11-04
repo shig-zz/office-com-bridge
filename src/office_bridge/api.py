@@ -21,12 +21,14 @@ class InspectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
+    target_id: str | None = None
 
 
 class InvokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     operation: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
+    target_id: str | None = None
 
 
 class SetPropertyRequest(BaseModel):
@@ -35,6 +37,7 @@ class SetPropertyRequest(BaseModel):
     value: Any = None
     confirm: bool = False
     expected_document: str | None = None
+    target_id: str | None = None
 
 
 class ComRequest(BaseModel):
@@ -46,6 +49,7 @@ class ComRequest(BaseModel):
     dry_run: bool = False
     confirm: bool = False
     expected_document: str | None = None
+    target_id: str | None = None
 
 
 class CaptureRequest(BaseModel):
@@ -166,36 +170,39 @@ def create_app(core: BridgeCore, settings: Settings) -> FastAPI:
 
     @app.post("/inspect")
     def inspect(request: InspectRequest) -> dict[str, Any]:
-        result = core.inspect(request.kind, request.params)
-        return _envelope_success(result, context_snapshot())
+        result, target = core.inspect(request.kind, request.params, request.target_id)
+        return _envelope_success(result, target or context_snapshot())
 
     @app.post("/invoke")
     def invoke(request: InvokeRequest) -> dict[str, Any]:
-        result = core.invoke(request.operation, request.params)
-        return _envelope_success(result, context_snapshot())
+        result, target = core.invoke(request.operation, request.params, request.target_id)
+        return _envelope_success(result, target or context_snapshot())
 
     @app.post("/set-property")
     def set_property(request: SetPropertyRequest) -> dict[str, Any]:
         params: dict[str, Any] = {"confirm": request.confirm}
         if request.expected_document is not None:
             params["expected_document"] = request.expected_document
-        result = core.set_property(request.property, request.value, params)
-        return _envelope_success(result, context_snapshot())
+        result, target = core.set_property(
+            request.property, request.value, params, request.target_id
+        )
+        return _envelope_success(result, target or context_snapshot())
 
     @app.post("/com")
     def com(request: ComRequest) -> dict[str, Any]:
         params: dict[str, Any] = {"confirm": request.confirm}
         if request.expected_document is not None:
             params["expected_document"] = request.expected_document
-        result = core.com(
+        result, target = core.com(
             request.mode,
             request.root,
             request.expression,
             request.value,
             request.dry_run,
             params,
+            request.target_id,
         )
-        return _envelope_success(result, context_snapshot())
+        return _envelope_success(result, target or context_snapshot())
 
     @app.post("/targets/capture")
     def capture_target(request: CaptureRequest) -> dict[str, Any]:
