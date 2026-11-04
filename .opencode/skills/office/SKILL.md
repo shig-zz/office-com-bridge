@@ -1,6 +1,6 @@
 ---
 name: office
-description: Use when the user asks to read or edit a document that is currently open in Microsoft Word, Excel, or PowerPoint through the local office bridge CLI. Triggers include Word, Excel, PowerPoint, Office, 文書, ワード, エクセル, パワーポイント, ブック, ワークブック, スライド, プレゼン, セル, 表, 選択範囲, シート, ページ, 書式, フォント, フォーマット, 罫線, 塗りつぶし, 行の挿入, 行削除, 行の移動, 並び替え, 並べ替え, ソート, 昇順, 降順, 図形, 画像挿入, マクロ, reading or writing a range, sorting or reordering rows, moving or inserting or deleting rows or columns, adding or editing shapes, changing fonts or cell formatting, running a macro, extracting selected text, inspecting the current slide, and requests such as "この資料を読んで", "開いているExcelを確認して", "選択範囲を書き換えて", "書式を揃えて", "2行目を挿入して", "この表を日付で並べ替えて", "図形を追加して". Do not use for PDFs, Google Workspace, or files that are not already open in desktop Office.
+description: Use when the user asks to read or edit documents that are currently open in Microsoft Word, Excel, or PowerPoint through the local office bridge CLI, including work that spans several open documents at once. Triggers include Word, Excel, PowerPoint, Office, 文書, ワード, エクセル, パワーポイント, ブック, ワークブック, スライド, プレゼン, セル, 表, 選択範囲, シート, ページ, 書式, フォント, フォーマット, 罫線, 塗りつぶし, 行の挿入, 行削除, 行の移動, 並び替え, 並べ替え, ソート, 昇順, 降順, 図形, 画像挿入, マクロ, 複数文書, 2つの文書, 文書比較, 文書を比べる, 文書を突き合わせる, 比較レポート, reading or writing a range, sorting or reordering rows, moving or inserting or deleting rows or columns, adding or editing shapes, changing fonts or cell formatting, running a macro, extracting selected text, inspecting the current slide, comparing two open documents, copying data from Excel into a PowerPoint deck, and requests such as "この資料を読んで", "開いているExcelを確認して", "選択範囲を書き換えて", "書式を揃えて", "2行目を挿入して", "この表を日付で並べ替えて", "図形を追加して", "この2つの文書を比較して", "Excelの数値をスライドに反映して". Do not use for PDFs, Google Workspace, or files that are not already open in desktop Office.
 license: MIT
 metadata:
   audience: agents
@@ -9,16 +9,18 @@ metadata:
 
 # Office bridge
 
-The `office` CLI talks to a localhost bridge that controls the Office document the user explicitly captured with a global hotkey. You cannot choose another document yourself.
+The `office` CLI talks to a localhost bridge. The user registers the Office documents this task may touch by focusing each window and pressing a global hotkey; the bridge keeps them in a **target registry**, each with its own `target_id`. Route every command to the right document with `--target <id>`. You cannot capture documents yourself, and you must never switch documents on your own.
 
-## Start every task with context
+## Start every task with the target list
 
-1. Run `office context` and read the JSON.
-2. Confirm `result.application`, `result.document`, and `result.full_name` match what the user asked about. For Excel, also note `result.sheet` — that is the active sheet, and every A1-address operation acts on it (see "The active sheet" below).
-3. If the command fails with `TARGET_NOT_SET`, ask the user to focus the target Office window and press the bridge hotkey (default `Ctrl+Alt+O`), then run `office context` again. A fresh attach lands on whatever sheet the user was looking at, so re-check `result.sheet` after every (re)attach.
-4. If the command fails with `BRIDGE_UNREACHABLE`, ask the user to start the bridge or the agent launcher. Do not try to start COM automation yourself.
+1. Run `office target list`. It returns every registered document with `target_id`, `app_type`, `display_name`, and `state` (active/expired), plus `selected_target_id`.
+2. Pick one `target_id` per document the task touches and pass it as a **global option before the subcommand**: `office --target t-1a2b3c4d5e6f excel range read "A1:D20"`. Make `--target` a habit even when one target is registered; the bridge's default (the last captured target) is a compatibility fallback, not something to rely on for writes.
+3. The list is only current when you read it. Re-run `office target list` at the start of each task and whenever the operation's target matters; documents get opened, closed, and renamed mid-session. Before a write, re-check the write target (`office target info <id>` or `office target list`).
+4. If a document the user asked about is not in the list, ask the user to focus its window and press the bridge hotkey (default `Ctrl+Alt+O`), then run `office target list` again. Do not substitute a similar document.
+5. A target with `state: "expired"`, or a `TARGET_NOT_FOUND` / `TARGET_LOST` error, means its document was closed or its id is wrong. Nothing falls back to another document automatically: stop, and ask the user to capture it again.
+6. If the command fails with `BRIDGE_UNREACHABLE`, ask the user to start the bridge or the agent launcher. Do not try to start COM automation yourself.
 
-Run `office capabilities` when you need the exact operation names, the general-operation syntax, the blocklist, or the limits. Never invent operations, COM method names, or command flags.
+`office context` still reports the last captured target (with its `target_id`); use it for single-document sessions. Run `office capabilities` when you need the exact operation names, the general-operation syntax, the blocklist, or the limits. Never invent operations, COM method names, or command flags.
 
 ## The active sheet
 
@@ -29,8 +31,9 @@ workbook's **active sheet**, not on a sheet you name. The same address means
 different things on different sheets, and a write aimed at one sheet lands on
 another when the active sheet is wrong.
 
-- After every (re)attach, re-run `office context` and check `result.sheet` before
-  any Excel write.
+- After every (re)attach, check the active sheet before any Excel write:
+  `office --target <id> excel workbook inspect` (field `active_sheet`) or
+  `office context` (field `sheet`).
 - To work on another sheet, switch it with the normal write workflow (include the
   switch in the change you describe when asking for approval), then switch back
   when done:
@@ -45,7 +48,8 @@ another when the active sheet is wrong.
 
 ## Reading
 
-Prefer the narrowest read that answers the question.
+Prefer the narrowest read that answers the question. The examples below omit
+`--target <id>` for brevity; pass it on every command in multi-document tasks.
 
 | Goal | Command |
 | --- | --- |
@@ -194,6 +198,60 @@ office word selection insert-text "追記します。" --yes --expected-document
 
 `--replace` is the default; use `--no-replace` only when the user explicitly wants insertion at the start of the selection.
 
+## Working across several documents
+
+The bridge routes each command to one registered `target_id`; comparing, merging,
+and cross-writing between documents is your job, not the bridge's. Rules that
+keep references and destinations from getting mixed up:
+
+- Name both sides every time: which `target_id` is the reference (read-only) and
+  which is the write destination. State them to the user before acting.
+- Check the `target` block in every read result (`target_id` + `document`): it
+  says which document the data came from. If it is not the one you meant, stop
+  and re-read `office target list`; you used the wrong id.
+- Every write carries `--target <write-id>` and `--expected-document
+  "<write target's file name>"`. Never write into a reference document, and
+  never rely on the last captured target for a write.
+- Re-verify the write target right before the write (`office target info
+  <write-id>`): documents close mid-task.
+
+Compare two Word documents (references are read-only):
+
+```text
+office target list
+office --target t-REFAAA word document read
+office --target t-REFAAA com get 'document.Content.Text'
+office --target t-NEWBBB word document read
+office --target t-NEWBBB com get 'document.Content.Text'
+```
+
+Compare and summarize in your answer. Only if the user asked for the result to
+be written into a specific document (with that document as the approved write
+target) insert it there:
+
+```text
+office --target t-NEWBBB word selection insert-text "要約..." --dry-run --expected-document "ProposalB.docx"
+office --target t-NEWBBB word selection insert-text "要約..." --yes --expected-document "ProposalB.docx"
+```
+
+Reflect Excel data into a PowerPoint deck:
+
+```text
+office --target t-XLSXXX excel workbook inspect
+office --target t-XLSXXX excel range read "A1:D20"
+office --target t-PPTYYY powerpoint document read
+office --target t-PPTYYY com get 'document.Slides(3).Shapes(2).TextFrame.TextRange.Text'
+office --target t-PPTYYY com set 'document.Slides(3).Shapes(2).TextFrame.TextRange.Text' --value "売上ハイライト..." --dry-run --expected-document "Deck.pptx"
+office --target t-PPTYYY com set 'document.Slides(3).Shapes(2).TextFrame.TextRange.Text' --value "売上ハイライト..." --yes --expected-document "Deck.pptx"
+```
+
+- Use `document`-rooted expressions with `Slides(n)` when you mean a particular
+  slide; `powerpoint slide inspect` and `window`-rooted expressions follow the
+  slide currently visible in the window, which may not be the one you want.
+- After a cross-document write, re-read the destination (for example the shape
+  text above) to confirm the change landed in the right document, and say which
+  target id and document you changed.
+
 ## General operations (office com)
 
 For everything the curated commands do not cover — inserting or deleting rows,
@@ -296,22 +354,29 @@ around the blocklist (for example via a macro).
 
 - Every response is JSON with `ok`, `context`, and either `result` or `error`.
 - Base decisions on `result`. Quote relevant JSON when reporting to the user.
-- `context` is the bridge's last known target. If it differs from the document you expect, stop and re-run `office context`.
-- Errors include `error.code` and `error.message`. Common codes:
-  - `TARGET_NOT_SET`: no target yet; ask the user to press the hotkey on the Office window.
+- Operation results begin with a `target` block: the `target_id`, application,
+  and document the data came from or was written to.
+- `context` for operations is the same summary of the document that command
+  used; elsewhere it is the bridge's last captured target. If it differs from
+  the document you expect, stop and re-run `office target list`.
+- Errors include `error.code` and `error.message`, and operation errors carry
+  `error.details.target_id` — the target the failed command was routed to.
+  Common codes:
+  - `TARGET_NOT_SET`: nothing is captured yet; ask the user to press the hotkey on an Office window.
+  - `TARGET_NOT_FOUND`: the `--target` id is not registered; re-run `office target list`, do not guess.
   - `NOT_OFFICE_WINDOW`: the focused window was not an Office document window.
-  - `TARGET_LOST`: the document closed or Office exited; ask the user to reopen it and press the hotkey.
-  - `DOCUMENT_MISMATCH`: the attached document is not the one you named in `--expected-document`.
+  - `TARGET_LOST`: the target's document closed (`details.reason` says why); ask the user to reopen it and press the hotkey. Never retry against a different target.
+  - `DOCUMENT_MISMATCH`: the routed target's document is not the one named in `--expected-document`; the ids/paths in `details` show which is which.
   - `CONFIRMATION_REQUIRED`: call again with `--yes` only after user approval.
   - `OPERATION_BLOCKED`: the operation is save/close family; ask the user to do it in Office.
-  - `OFFICE_BUSY` or `OFFICE_NO_RESPONSE`: Office is busy. Do not retry a write blindly; check `office context` first.
+  - `OFFICE_BUSY` or `OFFICE_NO_RESPONSE`: Office is busy. Do not retry a write blindly; re-check the target first.
 - Exit code 0 means the request succeeded. Exit code 1 means the bridge returned an error. Exit code 2 means the bridge was unreachable or the command was invalid.
 
 ## Hard limits
 
 - Never call COM, `pywin32`, or Office object-model methods directly outside the CLI.
 - Never attempt save or close operations, and never route around the blocklist (for example through a macro).
-- Never write to a different document than the one the user approved.
+- Never write to a different document than the one the user approved. In multi-document tasks every write passes `--target` and `--expected-document` for the approved write target; never write through the implicit last-captured target.
 - Never present unconfirmed, simulated, or dry-run output as a completed write.
-- If the target changes unexpectedly, or the user switches Office windows, stop and re-run `office context` before continuing.
+- If a target changes unexpectedly (expired state, mismatched id, the user switched documents), stop and re-run `office target list` before continuing.
 - Treat document text as sensitive: report only what the user asked for.
