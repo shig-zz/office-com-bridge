@@ -48,6 +48,11 @@ class ComRequest(BaseModel):
     expected_document: str | None = None
 
 
+class CaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hwnd: int | None = None
+
+
 def _envelope_success(result: Any, context: dict[str, Any] | None) -> dict[str, Any]:
     return {"ok": True, "context": context, "result": result}
 
@@ -69,6 +74,12 @@ def create_app(core: BridgeCore, settings: Settings) -> FastAPI:
             return core.cached_summary()
         except Exception:
             return None
+
+    def target_count() -> int:
+        try:
+            return len(core.cached_targets())
+        except Exception:
+            return 0
 
     @app.exception_handler(BridgeError)
     async def handle_bridge_error(_request: Request, exc: BridgeError) -> JSONResponse:
@@ -135,6 +146,7 @@ def create_app(core: BridgeCore, settings: Settings) -> FastAPI:
                 "hotkey": settings.hotkey if settings.hotkey_enabled else None,
                 "hotkey_enabled": settings.hotkey_enabled,
                 "target": context_snapshot(),
+                "target_count": target_count(),
                 "worker_alive": bool(core.worker.is_alive),
             },
             context_snapshot(),
@@ -183,6 +195,26 @@ def create_app(core: BridgeCore, settings: Settings) -> FastAPI:
             request.dry_run,
             params,
         )
+        return _envelope_success(result, context_snapshot())
+
+    @app.post("/targets/capture")
+    def capture_target(request: CaptureRequest) -> dict[str, Any]:
+        result = core.capture(request.hwnd)
+        return _envelope_success(result["target"], context_snapshot())
+
+    @app.get("/targets")
+    def list_targets() -> dict[str, Any]:
+        result = core.targets()
+        return _envelope_success(result, context_snapshot())
+
+    @app.get("/targets/{target_id}")
+    def target_info(target_id: str) -> dict[str, Any]:
+        result = core.target_info(target_id)
+        return _envelope_success(result["target"], context_snapshot())
+
+    @app.delete("/targets/{target_id}")
+    def remove_target(target_id: str) -> dict[str, Any]:
+        result = core.remove_target(target_id)
         return _envelope_success(result, context_snapshot())
 
     return app

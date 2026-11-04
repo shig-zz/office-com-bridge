@@ -11,6 +11,7 @@ from typing import Any, Callable, TypeVar
 
 import pythoncom
 import pywintypes
+import win32gui
 
 from .com_expr import parse_expression
 from .config import Settings
@@ -22,10 +23,12 @@ from .errors import (
     office_busy,
     office_no_response,
     target_lost,
+    target_not_found,
     target_not_set,
 )
 from .operations import com_ops, registry
 from .target import ResolvedTarget, get_foreground_window, resolve_target
+from .targets import TargetRegistry, TargetState, dedupe_key, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -156,12 +159,36 @@ class ComWorker:
         self._thread = None
 
 
+def _window_exists(hwnd: int) -> bool:
+    try:
+        return bool(win32gui.IsWindow(int(hwnd)))
+    except Exception:
+        return True
+
+
+def _common_metadata(info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "full_name": str(info.get("full_name") or ""),
+        "path": str(info.get("path") or ""),
+    }
+
+
+def _app_metadata(info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in info.items()
+        if key not in {"document", "full_name", "path"}
+    }
+
+
 class BridgeCore:
     def __init__(self, settings: Settings, worker: ComWorker | None = None) -> None:
         self.settings = settings
         self.worker = worker or ComWorker()
-        self._target: ResolvedTarget | None = None
+        self._registry = TargetRegistry()
+        self._com_refs: dict[str, ResolvedTarget] = {}
         self._cached_summary: dict[str, Any] | None = None
+        self._cached_targets: list[dict[str, Any]] = []
         self._cache_lock = threading.Lock()
 
     def start(self) -> None:
@@ -176,59 +203,143 @@ class BridgeCore:
         self.worker.stop()
 
     def _shutdown(self) -> None:
-        self._target = None
-        self._set_cache(None)
+        self._registry.clear()
+        self._com_refs.clear()
+        self._refresh_caches()
 
     def cached_summary(self) -> dict[str, Any] | None:
         with self._cache_lock:
             return dict(self._cached_summary) if self._cached_summary else None
 
-    def _set_cache(self, summary: dict[str, Any] | None) -> None:
+    def cached_targets(self) -> list[dict[str, Any]]:
         with self._cache_lock:
-            self._cached_summary = dict(summary) if summary else None
+            return [dict(target) for target in self._cached_targets]
 
-    def select_foreground(self) -> dict[str, Any]:
-        return self.select_hwnd(get_foreground_window())
+    def _refresh_caches(self) -> None:
+        record = self._registry.selected()
+        summary = None
+        if record is not None and record.state is TargetState.ACTIVE:
+            summary = record.summary()
+        with self._cache_lock:
+            self._cached_summary = summary
+            self._cached_targets = self._registry.list_public()
 
-    def select_hwnd(self, hwnd: int) -> dict[str, Any]:
+    def capture(self, hwnd: int | None = None) -> dict[str, Any]:
+        if hwnd is None:
+            hwnd = get_foreground_window()
         return self.worker.call(
-            self._select_hwnd,
+            self._capture_hwnd,
             int(hwnd),
             timeout=self.settings.request_timeout,
         )
 
-    def _select_hwnd(self, hwnd: int) -> dict[str, Any]:
-        target = resolve_target(hwnd)
-        info = target.refresh_info()
+    def capture_foreground(self) -> dict[str, Any]:
+        return self.capture()
 
-        previous = self._target
-        self._target = target
-        summary = target.summary()
-        self._set_cache(summary)
+    def capture_hwnd(self, hwnd: int) -> dict[str, Any]:
+        return self.capture(int(hwnd))
 
-        if previous is not None:
-            try:
-                previous_summary = previous.summary()
-            except Exception:
-                previous_summary = None
-            logger.info(
-                "target switched: %s/%s -> %s/%s (hwnd=%s pid=%s)",
-                (previous_summary or {}).get("application"),
-                (previous_summary or {}).get("document"),
-                summary.get("application"),
-                summary.get("document"),
-                target.hwnd,
-                target.pid,
+    def _capture_hwnd(self, hwnd: int) -> dict[str, Any]:
+        resolved = resolve_target(hwnd)
+        info = resolved.refresh_info()
+        now = utc_now()
+        key = dedupe_key(
+            str(info.get("application") or resolved.app.value),
+            int(info.get("pid") or resolved.pid),
+            str(info.get("full_name") or ""),
+            resolved.hwnd,
+        )
+        existing = self._registry.find_active_by_dedupe(key)
+        if existing is not None:
+            record = self._registry.update_metadata(
+                existing.target_id,
+                display_name=str(info.get("document") or existing.display_name),
+                metadata=_common_metadata(info),
+                app_metadata=_app_metadata(info),
+                now=now,
             )
+            action = "re-selected"
         else:
-            logger.info(
-                "target selected: application=%s document=%s hwnd=%s pid=%s",
-                summary.get("application"),
-                summary.get("document"),
-                target.hwnd,
-                target.pid,
+            record = self._registry.add(
+                app_type=str(info.get("application") or resolved.app.value).lower(),
+                display_name=str(info.get("document") or ""),
+                dedupe_key=key,
+                metadata=_common_metadata(info),
+                app_metadata=_app_metadata(info),
+                now=now,
             )
-        return {"target": info}
+            action = "registered"
+            for removed in self._registry.purge_expired():
+                self._com_refs.pop(removed, None)
+        if record is None:  # pragma: no cover - defensive
+            raise internal_error("The target record disappeared during capture.")
+        self._com_refs[record.target_id] = resolved
+        self._registry.select(record.target_id, now=now)
+        self._refresh_caches()
+        logger.info(
+            "target %s: id=%s application=%s document=%s hwnd=%s pid=%s (targets=%d)",
+            action,
+            record.target_id,
+            record.app_type,
+            record.display_name,
+            resolved.hwnd,
+            resolved.pid,
+            len(self._registry),
+        )
+        return {"target": record.public()}
+
+    def targets(self) -> dict[str, Any]:
+        return self.worker.call(self._targets, timeout=self.settings.request_timeout)
+
+    def _targets(self) -> dict[str, Any]:
+        for record in self._registry.active_records():
+            hwnd = record.app_metadata.get("hwnd")
+            if hwnd and not _window_exists(int(hwnd)):
+                self._expire_target(record.target_id, "window_gone")
+        self._refresh_caches()
+        return {
+            "targets": self._registry.list_public(),
+            "selected_target_id": self._registry.selected_target_id,
+        }
+
+    def target_info(self, target_id: str) -> dict[str, Any]:
+        return self.worker.call(
+            self._target_info,
+            str(target_id),
+            timeout=self.settings.request_timeout,
+        )
+
+    def _target_info(self, target_id: str) -> dict[str, Any]:
+        record = self._registry.get(target_id)
+        if record is None:
+            raise target_not_found(target_id)
+        if record.state is TargetState.ACTIVE:
+            resolved = self._com_refs.get(target_id)
+            if resolved is None or not resolved.is_alive():
+                self._expire_target(target_id, "com_reference_lost")
+            else:
+                self._sync_record(target_id, resolved.refresh_info())
+        self._refresh_caches()
+        record = self._registry.get(target_id)
+        if record is None:  # pragma: no cover - defensive
+            raise target_not_found(target_id)
+        return {"target": record.public()}
+
+    def remove_target(self, target_id: str) -> dict[str, Any]:
+        return self.worker.call(
+            self._remove_target,
+            str(target_id),
+            timeout=self.settings.request_timeout,
+        )
+
+    def _remove_target(self, target_id: str) -> dict[str, Any]:
+        record = self._registry.remove(target_id)
+        if record is None:
+            raise target_not_found(target_id)
+        self._com_refs.pop(target_id, None)
+        self._refresh_caches()
+        logger.info("target removed: id=%s document=%s", target_id, record.display_name)
+        return {"removed": target_id, "target": record.public()}
 
     def context(self) -> dict[str, Any]:
         return self.worker.call(self._context, timeout=self.settings.request_timeout)
@@ -236,7 +347,10 @@ class BridgeCore:
     def _context(self) -> dict[str, Any]:
         target = self._require_target()
         info = target.refresh_info()
-        self._set_cache(target.summary())
+        selected_id = self._registry.selected_target_id
+        if selected_id is not None:
+            self._sync_record(selected_id, info)
+        self._refresh_caches()
         return info
 
     def inspect(self, kind: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -336,18 +450,47 @@ class BridgeCore:
         )
 
     def _require_target(self) -> ResolvedTarget:
-        if self._target is None:
+        selected_id = self._registry.selected_target_id
+        if selected_id is None:
             raise target_not_set()
-        if not self._target.is_alive():
-            self._clear_target("the document or application is no longer available")
-            raise target_lost()
-        return self._target
+        record = self._registry.get(selected_id)
+        if record is None or record.state is not TargetState.ACTIVE:
+            self._registry.clear_selection()
+            self._refresh_caches()
+            raise target_lost(
+                details={"target_id": selected_id, "reason": "expired"}
+            )
+        resolved = self._com_refs.get(selected_id)
+        if resolved is None or not resolved.is_alive():
+            self._expire_target(selected_id, "com_reference_lost")
+            raise target_lost(
+                details={"target_id": selected_id, "reason": "com_reference_lost"}
+            )
+        return resolved
 
-    def _clear_target(self, reason: str) -> None:
-        summary = self._target.summary() if self._target is not None else None
-        self._target = None
-        self._set_cache(None)
-        logger.warning("target invalidated: %s (was %s)", reason, summary)
+    def _expire_target(self, target_id: str, reason: str) -> None:
+        record = self._registry.expire(target_id, reason)
+        self._com_refs.pop(target_id, None)
+        self._refresh_caches()
+        if record is not None:
+            logger.warning(
+                "target invalidated: id=%s reason=%s (was %s/%s)",
+                target_id,
+                reason,
+                record.app_type,
+                record.display_name,
+            )
+
+    def _sync_record(self, target_id: str, info: dict[str, Any]) -> None:
+        record = self._registry.get(target_id)
+        if record is None:
+            return
+        self._registry.update_metadata(
+            target_id,
+            display_name=str(info.get("document") or record.display_name),
+            metadata=_common_metadata(info),
+            app_metadata=_app_metadata(info),
+        )
 
     def _execute(
         self,
@@ -355,12 +498,15 @@ class BridgeCore:
         function: Callable[[ResolvedTarget], T],
     ) -> T:
         target = self._require_target()
+        target_id = self._registry.selected_target_id
         started = time.perf_counter()
         success = False
         try:
             result = function(target)
             success = True
-            self._set_cache(target.summary())
+            if target_id is not None:
+                self._sync_record(target_id, target.info)
+            self._refresh_caches()
             return result
         except BridgeError as exc:
             logger.warning(
@@ -373,8 +519,11 @@ class BridgeCore:
             raise
         except BaseException as exc:
             if not target.is_alive():
-                self._clear_target("the document or application is no longer available")
-                raise target_lost() from exc
+                if target_id is not None:
+                    self._expire_target(target_id, "com_reference_lost")
+                raise target_lost(
+                    details={"target_id": target_id, "reason": "com_reference_lost"}
+                ) from exc
             if isinstance(exc, pywintypes.com_error):
                 hresult = int(getattr(exc, "hresult", 0) or 0) & 0xFFFFFFFF
                 if hresult in _BUSY_HRESULTS:

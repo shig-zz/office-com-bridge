@@ -10,6 +10,7 @@ class ErrorCode:
     NO_DOCUMENT = "NO_DOCUMENT"
     NO_ACTIVE_SLIDE = "NO_ACTIVE_SLIDE"
     TARGET_NOT_SET = "TARGET_NOT_SET"
+    TARGET_NOT_FOUND = "TARGET_NOT_FOUND"
     TARGET_LOST = "TARGET_LOST"
     DOCUMENT_MISMATCH = "DOCUMENT_MISMATCH"
     RESOLVE_FAILED = "RESOLVE_FAILED"
@@ -67,8 +68,20 @@ def target_not_set() -> BridgeError:
     )
 
 
-def target_lost(message: str = "The selected Office document is no longer available.") -> BridgeError:
-    return BridgeError(ErrorCode.TARGET_LOST, message, 409)
+def target_lost(
+    message: str = "The selected Office document is no longer available.",
+    details: dict[str, Any] | None = None,
+) -> BridgeError:
+    return BridgeError(ErrorCode.TARGET_LOST, message, 409, details)
+
+
+def target_not_found(target_id: str) -> BridgeError:
+    return BridgeError(
+        ErrorCode.TARGET_NOT_FOUND,
+        f"No registered target matches id {target_id!r}. Run 'office target list' to see registered documents.",
+        404,
+        {"target_id": target_id},
+    )
 
 
 def document_mismatch(expected: str, actual: str) -> BridgeError:

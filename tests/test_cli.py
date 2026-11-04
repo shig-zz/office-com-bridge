@@ -22,9 +22,22 @@ class FakeClient:
             },
         }
         self._invoke = invoke or (lambda operation, params: {"ok": True, "result": {"operation": operation}})
+        self._targets = {
+            "ok": True,
+            "result": {
+                "targets": [
+                    {"target_id": "t-aaaa1111aaaa", "display_name": "Book1.xlsx", "state": "active"},
+                    {"target_id": "t-bbbb2222bbbb", "display_name": "Doc1.docx", "state": "expired"},
+                ],
+                "selected_target_id": "t-aaaa1111aaaa",
+            },
+        }
         self.invocations: list[tuple[str, dict[str, Any]]] = []
         self.set_calls: list[tuple[str, Any, bool, Any]] = []
         self.com_calls: list[tuple[str, str, str, Any, bool, bool, Any]] = []
+        self.capture_calls: list[Any] = []
+        self.info_calls: list[str] = []
+        self.remove_calls: list[str] = []
 
     def health(self):
         return self._health
@@ -49,6 +62,21 @@ class FakeClient:
     def com(self, mode, root, expression, value, dry_run, confirm, expected_document):
         self.com_calls.append((mode, root, expression, value, dry_run, confirm, expected_document))
         return {"ok": True, "result": {"mode": mode}}
+
+    def capture(self, hwnd=None):
+        self.capture_calls.append(hwnd)
+        return {"ok": True, "result": {"target_id": "t-aaaa1111aaaa", "state": "active"}}
+
+    def targets(self):
+        return self._targets
+
+    def target_info(self, target_id):
+        self.info_calls.append(target_id)
+        return {"ok": True, "result": {"target_id": target_id}}
+
+    def remove_target(self, target_id):
+        self.remove_calls.append(target_id)
+        return {"ok": True, "result": {"removed": target_id}}
 
 
 def install_client(monkeypatch, client: FakeClient) -> None:
@@ -350,3 +378,41 @@ def test_load_values_rejects_both_sources(tmp_path) -> None:
     path.write_text("[[1]]", encoding="utf-8")
     with pytest.raises(cli.typer.BadParameter):
         cli._load_values("[[1]]", path)
+
+def test_target_capture_uses_foreground_by_default(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["target", "capture"])
+    assert result.exit_code == 0
+    assert client.capture_calls == [None]
+    assert parse_stdout(result)["result"]["target_id"] == "t-aaaa1111aaaa"
+
+
+def test_target_capture_passes_hwnd(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["target", "capture", "--hwnd", "1234"])
+    assert result.exit_code == 0
+    assert client.capture_calls == [1234]
+
+
+def test_target_list_shows_entries(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["target", "list"])
+    assert result.exit_code == 0
+    body = parse_stdout(result)["result"]
+    assert body["selected_target_id"] == "t-aaaa1111aaaa"
+    assert [entry["state"] for entry in body["targets"]] == ["active", "expired"]
+
+
+def test_target_info_and_remove_pass_ids_through(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["target", "info", "t-aaaa1111aaaa"])
+    assert result.exit_code == 0
+    assert client.info_calls == ["t-aaaa1111aaaa"]
+
+    result = CliRunner().invoke(cli.app, ["target", "remove", "t-bbbb2222bbbb"])
+    assert result.exit_code == 0
+    assert client.remove_calls == ["t-bbbb2222bbbb"]

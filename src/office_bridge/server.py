@@ -181,12 +181,14 @@ def main(argv: list[str] | None = None) -> int:
         if settings.hotkey_enabled:
             def on_hotkey() -> None:
                 try:
-                    result = core.select_foreground()
+                    result = core.capture_foreground()
                     target = result.get("target", {})
                     logger.info(
-                        "hotkey target: %s/%s",
-                        target.get("application"),
-                        target.get("document"),
+                        "hotkey capture: id=%s %s/%s (state=%s)",
+                        target.get("target_id"),
+                        target.get("app_type"),
+                        target.get("display_name"),
+                        target.get("state"),
                     )
                     if settings.launch_agent:
                         try:
@@ -199,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                     if settings.beep:
                         _beep(0x00000030)
                 except Exception:
-                    logger.exception("hotkey target selection failed")
+                    logger.exception("hotkey target capture failed")
                     if settings.beep:
                         _beep(0x00000010)
 

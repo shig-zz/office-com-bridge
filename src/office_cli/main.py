@@ -33,6 +33,9 @@ powerpoint_document_app = typer.Typer(
 com_app = typer.Typer(
     help="General Office object-model commands (get, call, set).", no_args_is_help=True
 )
+target_app = typer.Typer(
+    help="Manage the documents registered with the bridge.", no_args_is_help=True
+)
 
 app.add_typer(excel_app, name="excel")
 excel_app.add_typer(excel_range_app, name="range")
@@ -44,6 +47,7 @@ app.add_typer(powerpoint_app, name="powerpoint")
 powerpoint_app.add_typer(powerpoint_slide_app, name="slide")
 powerpoint_app.add_typer(powerpoint_document_app, name="document")
 app.add_typer(com_app, name="com")
+app.add_typer(target_app, name="target")
 
 
 @dataclass(slots=True)
@@ -93,6 +97,21 @@ class BridgeClient:
 
     def capabilities(self) -> dict[str, Any]:
         return self.request("GET", "/capabilities")
+
+    def capture(self, hwnd: int | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if hwnd is not None:
+            payload["hwnd"] = hwnd
+        return self.request("POST", "/targets/capture", payload)
+
+    def targets(self) -> dict[str, Any]:
+        return self.request("GET", "/targets")
+
+    def target_info(self, target_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/targets/{target_id}")
+
+    def remove_target(self, target_id: str) -> dict[str, Any]:
+        return self.request("DELETE", f"/targets/{target_id}")
 
     def inspect(self, kind: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.request("POST", "/inspect", {"kind": kind, "params": params or {}})
@@ -287,6 +306,43 @@ def context(ctx: typer.Context) -> None:
 def capabilities(ctx: typer.Context) -> None:
     """List the allowed inspection and write operations."""
     _run(ctx, lambda client: client.capabilities())
+
+
+@target_app.command("capture")
+def target_capture(
+    ctx: typer.Context,
+    hwnd: int = typer.Option(
+        None,
+        "--hwnd",
+        help="Window handle to attach instead of the foreground window (diagnostics).",
+    ),
+) -> None:
+    """Register the foreground Office window (same as the bridge hotkey)."""
+    _run(ctx, lambda client: client.capture(hwnd))
+
+
+@target_app.command("list")
+def target_list(ctx: typer.Context) -> None:
+    """List the documents registered with the bridge and their state."""
+    _run(ctx, lambda client: client.targets())
+
+
+@target_app.command("info")
+def target_info(
+    ctx: typer.Context,
+    target_id: str = typer.Argument(..., help="Target id printed by 'office target list'."),
+) -> None:
+    """Show one registered document, refreshed and validated against Office."""
+    _run(ctx, lambda client: client.target_info(target_id))
+
+
+@target_app.command("remove")
+def target_remove(
+    ctx: typer.Context,
+    target_id: str = typer.Argument(..., help="Target id to unregister."),
+) -> None:
+    """Unregister a document from the bridge."""
+    _run(ctx, lambda client: client.remove_target(target_id))
 
 
 @app.command()

@@ -20,6 +20,7 @@ class FakeCore:
         self.summary = {"application": "Excel", "document": "Book1.xlsx"}
         self.set_calls: list[tuple[str, Any, dict[str, Any]]] = []
         self.com_calls: list[tuple[str, str, str, Any, bool, dict[str, Any]]] = []
+        self.capture_calls: list[int | None] = []
 
     def cached_summary(self):
         return dict(self.summary)
@@ -59,6 +60,45 @@ class FakeCore:
     ):
         self.com_calls.append((mode, root, expression, value, dry_run, params))
         return {"mode": mode, "root": root, "expression": expression}
+
+    def cached_targets(self):
+        return [dict(self.summary)]
+
+    def capture(self, hwnd: int | None = None):
+        self.capture_calls.append(hwnd)
+        return {
+            "target": {
+                "target_id": "t-aaaa1111aaaa",
+                "app_type": "excel",
+                "display_name": "Book1.xlsx",
+                "state": "active",
+                "expired_reason": None,
+            }
+        }
+
+    def targets(self):
+        return {
+            "targets": [
+                {
+                    "target_id": "t-aaaa1111aaaa",
+                    "app_type": "excel",
+                    "display_name": "Book1.xlsx",
+                    "state": "active",
+                    "expired_reason": None,
+                }
+            ],
+            "selected_target_id": "t-aaaa1111aaaa",
+        }
+
+    def target_info(self, target_id: str):
+        if target_id == "t-missing00000":
+            raise BridgeError(ErrorCode.TARGET_NOT_FOUND, "gone", 404)
+        return {"target": {"target_id": target_id, "state": "active"}}
+
+    def remove_target(self, target_id: str):
+        if target_id == "t-missing00000":
+            raise BridgeError(ErrorCode.TARGET_NOT_FOUND, "gone", 404)
+        return {"removed": target_id, "target": {"target_id": target_id}}
 
 
 @pytest.fixture()
@@ -184,3 +224,53 @@ def test_com_rejects_missing_expression() -> None:
     response = client.post("/com", json={"mode": "get"})
     assert response.status_code == 400
     assert response.json()["ok"] is False
+
+
+def test_health_includes_target_count(client: TestClient) -> None:
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["result"]["target_count"] == 1
+
+
+def test_capture_target_returns_record(client: TestClient) -> None:
+    response = client.post("/targets/capture", json={})
+    assert response.status_code == 200
+    target = response.json()["result"]
+    assert target["target_id"] == "t-aaaa1111aaaa"
+    assert target["state"] == "active"
+
+
+def test_capture_target_passes_hwnd() -> None:
+    core = FakeCore()
+    client = TestClient(create_app(core, Settings()))
+    response = client.post("/targets/capture", json={"hwnd": 1234})
+    assert response.status_code == 200
+    assert core.capture_calls == [1234]
+
+
+def test_list_targets(client: TestClient) -> None:
+    response = client.get("/targets")
+    assert response.status_code == 200
+    body = response.json()["result"]
+    assert body["selected_target_id"] == "t-aaaa1111aaaa"
+    assert body["targets"][0]["target_id"] == "t-aaaa1111aaaa"
+
+
+def test_target_info_and_missing_id(client: TestClient) -> None:
+    response = client.get("/targets/t-aaaa1111aaaa")
+    assert response.status_code == 200
+    assert response.json()["result"]["target_id"] == "t-aaaa1111aaaa"
+
+    response = client.get("/targets/t-missing00000")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == ErrorCode.TARGET_NOT_FOUND
+
+
+def test_remove_target(client: TestClient) -> None:
+    response = client.delete("/targets/t-aaaa1111aaaa")
+    assert response.status_code == 200
+    assert response.json()["result"]["removed"] == "t-aaaa1111aaaa"
+
+    response = client.delete("/targets/t-missing00000")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == ErrorCode.TARGET_NOT_FOUND
