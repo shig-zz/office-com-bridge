@@ -1,10 +1,12 @@
 # Office COM Bridge
 
 Local HTTP and CLI bridge between AI agents and running Microsoft Office
-desktop applications. Select a live Word, Excel, or PowerPoint window, then
-read and write the current selection or document. Curated commands cover the
-common cases; a general object-model layer (`POST /com`, `office com ...`)
-exposes every other Word/Excel/PowerPoint operation.
+desktop applications. Capture live Word, Excel, or PowerPoint windows with a
+hotkey; each becomes a **registered target** with its own `target_id`, and
+every command routes to the target you name (or the last captured one when you
+do not). Read and write the current selection or document. Curated commands
+cover the common cases; a general object-model layer (`POST /com`, `office com
+...`) exposes every other Word/Excel/PowerPoint operation.
 
 The bridge never launches Office and never saves or closes documents: member
 names starting with `save` or `close` (plus `quit`/`exit`) are rejected for
@@ -57,10 +59,12 @@ Defaults:
 - Logs: `%LOCALAPPDATA%\office-bridge\logs`
 
 Open a document in Word, Excel, or PowerPoint, focus its window, and press the
-hotkey. The selected document becomes the bridge target, and the configured
-agent starts in a new Windows Terminal window with the Office skill available,
-so it can immediately read or edit that document. Use `--no-hotkey` for health
-checks or tests that do not need target selection:
+hotkey. That document is **captured into the target registry** (existing
+targets are kept), and the configured agent starts in a new Windows Terminal
+window with the Office skill available, so it can immediately read or edit that
+document. Capture each document a task touches, then route commands with
+`--target <id>`. Use `--no-hotkey` for health checks or tests that do not need
+target capture:
 
 ```powershell
 .\.venv\Scripts\office-bridge --no-hotkey --port 8733
@@ -78,12 +82,14 @@ directly:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 office health
+office target list
+office target info t-1a2b3c4d5e6f
 office context
 office capabilities
 office inspect excel.selection
-office excel range read A1:B2 --formulas
-office excel range write A1:B2 --json "[[1,2],[3,4]]" --dry-run
-office excel range write A1:B2 --json "[[1,2],[3,4]]" --yes
+office --target t-1a2b3c4d5e6f excel range read A1:B2 --formulas
+office --target t-1a2b3c4d5e6f excel range write A1:B2 --json "[[1,2],[3,4]]" --dry-run
+office --target t-1a2b3c4d5e6f excel range write A1:B2 --json "[[1,2],[3,4]]" --yes
 office excel range copy-format A1:B2 C1:D2 --yes
 office excel range set-format A1:B2 --font-name "MS Gothic" --font-size 11 --halign center --yes
 office excel range add-hyperlink E35 --url "https://example.com/" --yes
@@ -94,6 +100,13 @@ office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
 ```
+
+`--target <target_id>` (a global option, before the subcommand) routes the
+command to a captured target. Without it the bridge falls back to the last
+captured target; that is a compatibility default, so pass `--target` on every
+command in multi-document work. `office target list` shows every registered
+target with its `target_id` and `state`; `office target remove <id>` unregisters
+one.
 
 Writes require confirmation. `--dry-run` validates without changing the
 document; `--yes` skips the interactive prompt. Use `--expected-document` to
@@ -117,12 +130,22 @@ All endpoints return an envelope:
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Liveness and current target summary |
-| `GET /context` | Current target details |
+| `GET /context` | Current (default) target details |
 | `GET /capabilities` | Supported inspections, operations, properties, and general-operation info |
+| `GET /targets` | Registered targets with `target_id` and `state` |
+| `POST /targets/capture` | Capture a target by `hwnd` (tests; normally the hotkey captures) |
+| `GET /targets/{target_id}` | One target's details with a full liveness check |
+| `DELETE /targets/{target_id}` | Unregister a target |
 | `POST /inspect` | Read a document/selection view |
 | `POST /invoke` | Run a curated write operation |
 | `POST /set-property` | Change a curated property |
 | `POST /com` | General object-model access: `get`, `call`, or `set` on the attached document |
+
+Operation requests accept an optional top-level `target_id`; when omitted they
+use the last captured target. Operation results start with a `target` block and
+operation errors carry `error.details.target_id`. Unknown ids fail with
+`TARGET_NOT_FOUND`; closed documents with `TARGET_LOST` (no fallback to another
+document).
 
 Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"}}`.
 
@@ -236,8 +259,9 @@ The skill teaches the agent when and how to use the CLI.
 
 - Bind to loopback only.
 - Requests are processed serially in one STA worker.
-- The target is captured at selection time and invalidated when the document
- or application closes.
+- The target registry keeps every captured document until it closes; each
+  target has a stable `target_id` and is invalidated (never silently replaced)
+  when the document or application closes.
 - Reads are capped at 10,000 cells and 100,000 characters by default.
 - Save and close operations are blocked for general operations; all other
   writes require `confirm` and support `dry_run`.

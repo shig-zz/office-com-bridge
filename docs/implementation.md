@@ -68,8 +68,8 @@
 │ office-bridge プロセス                                      │
 │                                                             │
 │  hotkey thread ──► BridgeCore ──► COM worker (STA 1本)      │
-│  RegisterHotKey      対象の保持         pywin32 / COM       │
-│  GetForegroundWindow 要求の振り分け     Office オブジェクト │
+│  RegisterHotKey      対象レジストリ       pywin32 / COM     │
+│  GetForegroundWindow target_id 振り分け   Office オブジェクト │
 │                                                             │
 │  FastAPI + Uvicorn on 127.0.0.1:8733                        │
 └─────────────────────────────────────────────────────────────┘
@@ -110,7 +110,8 @@ HTTP ハンドラーやホットキーはキュー経由で処理を依頼する
 | `src/office_bridge/agent_config.py` | エージェントのプリセット、設定ファイル、Skill 配置、起動コマンド解決 |
 | `src/office_bridge/hotkey.py` | ホットキー文字列の解析、`RegisterHotKey`、メッセージループ |
 | `src/office_bridge/target.py` | HWND → Office 種別判定、COM ネイティブオブジェクト取得、文書解決 |
-| `src/office_bridge/com_worker.py` | STA ワーカー、要求キュー、対象保持、操作実行、エラー分類、ログ |
+| `src/office_bridge/targets.py` | `TargetRecord` / `TargetRegistry`: 対象 ID、重複キー、寿命・監査（COM 非依存） |
+| `src/office_bridge/com_worker.py` | STA ワーカー、要求キュー、対象レジストリと COM 参照保持、`target_id` 振り分け、操作実行、エラー分類、ログ |
 | `src/office_bridge/com_expr.py` | `/com` 用のメンバー連鎖・リテラル解析 |
 | `src/office_bridge/api.py` | FastAPI エンドポイント、Pydantic スキーマ、JSON エンベロープ |
 | `src/office_bridge/errors.py` | エラーコード、HTTP ステータス、例外詳細 |
@@ -136,7 +137,8 @@ HTTP ハンドラーやホットキーはキュー経由で処理を依頼する
 8. 終了時にホットキー解除、COM ワーカー停止、ミューテックス解放を行う。
 
 起動オプションは `--host`、`--port`、`--hotkey`、`--no-hotkey`、`--log-level`。
-`--no-hotkey` はヘルスチェックやテスト用で、この場合は対象を選択する経路がない。
+`--no-hotkey` はヘルスチェックやテスト用で、この場合は前景ウィンドウからの捕捉経路が
+ない。テスト・診断に限り `POST /targets/capture`（HWND 指定）で登録できる。
 
 ---
 
@@ -209,13 +211,25 @@ PowerPoint は Excel / Word のような `OBJID_NATIVEOM` 経由の文書ウィ�
 
 ### 3.4 対象の保持と無効化
 
-`ResolvedTarget` は `AppKind`、HWND、PID、Application、Document、Window、情報辞書を持つ。
-操作のたびに `is_alive()`（`Application.Name` と `Document.Name` の参照）を確認する。
-失敗した場合は対象をクリアし、`TARGET_LOST` を返す。
+対象は `TargetRegistry`（`src/office_bridge/targets.py`）に複数保持する。各対象は
+`TargetRecord` で、ブリッッジが発行する `target_id`（`t-` + 16 進 12 桁）、`AppKind`、
+ウィンドウタイトル、PID、フルパス、メタデータ（シート名・スライド番号など）、
+状態（`active` / `expired`）と時刻を持つ。COM オブジェクト参照そのものは
+`BridgeCore._com_refs` に記録とは別に保持し、ワーカーのスレッドでのみ触る。
 
-ホットキーを押すたびに対象は前景ウィンドウへ切り替わる。同じ文書でも切替としてログに残す。
-対象情報にはアプリ名、文書名、フルパス、HWND、PID、ウィンドウタイトル、Excel の
-アクティブシート、PowerPoint のスライド番号などを含める。
+- ホットキーは前景 Office ウィンドウを **捕捉（capture）** して登録する。既存の対象は
+  置き換わらず、捕捉時のみ `selected_target_id`（既定の対象）が更新される。
+  同じウィンドウの再捕捉は新しい ID を発行せず、既存レコードの時刻を更新する。
+- 重複判定は `(pid, full_name 小文字)` キー。フルパスが解けない未保存文書は
+  `hwnd:{hwnd}` を使う。同名ファイルでも別プロセス（例: Word を `/x` で複数起動）なら
+  別対象として登録される。
+- 操作のたびに COM 参照の生存確認（`Application.Name` / `Document.Name`）を行う。
+  失効すると理由（`closed` / `window_gone` / `com_reference_lost`）を記録して
+  `expired` にする。失効レコードは監査のため保持し、50 件を超えない範囲で古いものから
+  削除する（active は削除しない）。失効対象への操作は `TARGET_LOST` を返し、
+  他の対象へフォールバックすることはない。
+- 対象情報にはアプリ種別、文書名、フルパス、HWND、PID、ウィンドウタイトル、Excel の
+  アクティブシート、PowerPoint のスライド番号などを含める。
 
 ---
 
@@ -223,7 +237,7 @@ PowerPoint は Excel / Word のような `OBJID_NATIVEOM` 経由の文書ウィ�
 
 ### 4.1 STA ワーカー
 
-`ComWorker` は 1 本のスレッドで次を行う（`src/office_bridge/com_worker.py:58`）。
+`ComWorker` は 1 本のスレッドで次を行う（`src/office_bridge/com_worker.py:61`）。
 
 1. `pythoncom.CoInitialize()` で STA を初期化する。
 2. キューから `(function, args, kwargs, future)` を取り出す。
@@ -252,30 +266,39 @@ PowerPoint は Excel / Word のような `OBJID_NATIVEOM` 経由の文書ウィ�
 
 ### 4.3 エラー分類
 
-`BridgeCore._execute`（`src/office_bridge/com_worker.py:352`）が操作を包み、
+`BridgeCore._execute`（`src/office_bridge/com_worker.py:567`）が操作を包み、
 以下に分類する。
 
-- `BridgeError`: そのまま返す。操作ログにコードを残す。
-- 対象が既に死んでいる: 対象をクリアして `TARGET_LOST`。
+- `BridgeError`: そのまま返す。操作ログにコードを残す。操作系エラーは
+  `details.target_id` を付す。
+- 振り向け先の対象の生存確認に失敗: その対象を理由付きで `expired` にして
+  `TARGET_LOST`。他の対象へは振り向けない。
 - `pywintypes.com_error` で HRESULT がビジー系:
   `0x8001010A`、`0x800AC472`、`0x80010001` → `OFFICE_BUSY`（503）。
 - その他の COM エラー: `COM_ERROR`（502）。HRESULT を 16 進で詳細に付ける。
 - 想定外の例外: `INTERNAL_ERROR`（500）。
 
-操作ログには `operation`、`target=Application/Document`、`ok`、`duration_ms` を残す。
-文書内容やセル値は原則としてログに残さない。
+操作ログには `operation`、`target=Application/Document`、`id=target_id`、`ok`、
+`duration_ms` を残す。文書内容やセル値は原則としてログに残さない。
 
 ### 4.4 対象のライフサイクル
 
-- 対象はプロセス内のメモリに 1 つだけ保持する。複数文書の同時保持はしない。
-- ホットキーで新しい対象に差し替える。古い参照はフィールドから外れる。
-- 文書クローズや Office 終了時は、次回の `is_alive()` で検出して無効化する。
+- 対象はプロセス内のメモリに複数保持する（`TargetRegistry` + `_com_refs`）。
+  ホットキーは捕捉であり、既存対象を置き換えない。既定の対象（`selected_target_id`）は
+  捕捉時だけ更新される。
+- `--target`/`target_id` を省略した要求は既定の対象へ送る（単一対象運用との後方互換）。
+- 文書クローズや Office 終了時は、一覧・詳細・操作の生存確認で検出し、理由付きで
+  `expired` にする。`GET /targets` はウィンドウ生存（`IsWindow`）の軽い確認のみで、
+  フルな COM 生存確認は詳細取得と操作時に行う。
+- 失効対象は再捕捉されない限り復活しない。操作は `TARGET_LOST`、ID が無ければ
+  `TARGET_NOT_FOUND` を返し、他の対象へ自動的に切り替えることはない。
 - ブリッジ再起動で対象は失われる。再度ホットキーを押す必要がある。
-- `BridgeCore.stop()` はワーカー上で対象とキャッシュをクリアしてからスレッドを止める。
+- `BridgeCore.stop()` はワーカー上でレジストリ・COM 参照・キャッシュをクリアしてから
+  スレッドを止める。
 
-注意点として、`is_alive()` はあらゆる例外を「対象消失」とみなす。Office が一時的に
-ビジーで `Name` 参照に失敗した場合も `TARGET_LOST` になり得る。その場合は再度ホットキーで
-対象を選び直す。
+注意点として、生存確認はあらゆる例外を「参照失効」とみなす。Office が一時的に
+ビジーで `Name` 参照に失敗した場合も `com_reference_lost` になり得る。その場合は
+同じウィンドウでホットキーを押し直せば同じ ID が再選択される。
 
 ---
 
@@ -306,16 +329,26 @@ FastAPI で実装し、`/docs` に OpenAPI UI を出す。Redoc は無効。す�
 }
 ```
 
-`context` はブリッジが最後に把握している対象のスナップショットで、`/health` や
-エラー応答でも返る。`/context` だけは実際に COM を読んで最新化する。
+`context` は対象のスナップショットで、`/health` やエラー応答でも返る。操作系エンドポイント
+（`/inspect` `/invoke` `/set-property` `/com`）では **そのコマンドが実際に使った対象**
+（`target_id` で振り向けた対象、省略時は既定の対象）の要約であり、それ以外の場所では
+既定の対象（`selected_target_id`）の要約である。`/context` と `GET /targets/{id}` だけは
+実際に COM を読んで最新化する。操作系の `result` は先頭に `target` ブロック
+（`target_id` / `application` / `document` など）を持ち、データがどの文書から来たか・
+どこへ書き込まれたかを明示する。操作系エラーは `error.details.target_id` に振り向け先を
+載せる。
 
 ### 5.1 エンドポイント
 
 | メソッド | パス | 用途 | 確認 |
 | --- | --- | --- | --- |
-| GET | `/health` | 稼働状態、バージョン、ホットキー、対象、ワーカー生存 | 不要 |
-| GET | `/context` | 対象の最新情報 | 不要 |
+| GET | `/health` | 稼働状態、バージョン、ホットキー、既定の対象、`target_count`、ワーカー生存 | 不要 |
+| GET | `/context` | 既定の対象の最新情報 | 不要 |
 | GET | `/capabilities` | 読み取り・書き込み・プロパティ・`/com` の定義、上限、ブロックリスト | 不要 |
+| GET | `/targets` | 登録済み対象の一覧（失効判定は軽い確認のみ） | 不要 |
+| POST | `/targets/capture` | HWND を指定して対象を登録（テスト用。通常はホットキー） | 不要 |
+| GET | `/targets/{target_id}` | 対象の詳細（フルな COM 生存確認を行う） | 不要 |
+| DELETE | `/targets/{target_id}` | 対象を登録から外す | 不要 |
 | POST | `/inspect` | 読み取り | 不要 |
 | POST | `/invoke` | キュレーション済み書き込み | `params.confirm` |
 | POST | `/set-property` | 許可済みプロパティ変更 | `confirm` |
@@ -362,6 +395,11 @@ Pydantic モデルは `extra="forbid"` で、未知のフィールドを拒否�
 `expected_document` をトップレベルに置く。API の形が操作種別で非対称なので、
 クライアント実装時は注意が必要である。
 
+操作系 4 エンドポイントはいずれもトップレベルの `target_id`（省略可）を受け付け、
+指定されればその対象へ振り向ける。省略時は既定の対象（最後に捕捉された対象）を使い、
+これは単一対象運用との後方互換のための挙動である。登録に無い ID や失効対象を指定すると
+`TARGET_NOT_FOUND` / `TARGET_LOST` となり、他の対象へフォールバックすることはない。
+
 ### 5.3 例外ハンドリング
 
 - `BridgeError`: 定義済みの HTTP ステータスとエンベロープで返す。
@@ -382,7 +420,10 @@ JSON（`ensure_ascii=False`、インデント 2）、診断は標準エラーに
 | コマンド | 内容 |
 | --- | --- |
 | `office health` | ブリッジの稼働確認 |
-| `office context` | 対象アプリ・文書・パスなどの確認 |
+| `office target list` | 登録済み対象の一覧（`target_id`、状態、既定の対象） |
+| `office target info <target_id>` | 対象の詳細（COM 生存確認付き） |
+| `office target remove <target_id>` | 対象を登録から外す |
+| `office context` | 既定の対象のアプリ・文書・パスなどの確認 |
 | `office capabilities` | 操作一覧、上限、ブロックリストの確認 |
 | `office inspect selection|document` | 共通の選択範囲・文書情報 |
 | `office excel range read A1:D20 [--formulas]` | アクティブシートの範囲読み取り |
@@ -398,16 +439,21 @@ JSON（`ensure_ascii=False`、インデント 2）、診断は標準エラーに
 | `office set-property excel.active_sheet --value Sheet2` | 許可済みプロパティ変更 |
 | `office com get|call|set ...` | 汎用オブジェクトモデル操作 |
 
+全コマンドはサブコマンドの前に付ける大域オプション `--target <target_id>` を受け付ける
+（環境変数 `OFFICE_BRIDGE_TARGET` でも指定可）。指定するとその対象へ振り向け、省略時は
+既定の対象が使われる。複数文書の作業では常に `--target` を付けるのが運用規則である。
+
 ### 6.2 書き込みワークフロー
 
 CLI の書き込みは次の流れを強制する。
 
-1. `office context` で対象を確認する（Skill の手順）。
+1. `office target list` / `office target info` で書き込み先の対象を確認する（Skill の手順）。
 2. `--dry-run` で範囲・配列・書式オプションを検証する。このとき `confirm` は送らない。
-3. 対話端末なら、対象と変更内容を stderr に表示し、`typer.confirm` で承認を取る。
-   既定は No。
+3. 対話端末なら、振り向け先の対象（`target_id` と文書名）と変更内容を stderr に表示し、
+   `typer.confirm` で承認を取る。既定は No。対象が失効していれば承認を求めずエラーになる。
+   対象が複数登録されている場合は、書き込み先に指定した ID を明示的に表示する。
 4. `--yes` 指定時はプロンプトを省略し、`confirm: true` を送る。
-5. `--expected-document` 指定時は、対象の `document` / `full_name` と照合する。
+5. `--expected-document` 指定時は、振り向け先の `document` / `full_name` と照合する。
 6. サーバー側でも `confirm` と `expected_document` を再検証する。
 
 対話端末でない場合に `--yes` を付けずに書き込もうとすると、エラー終了する。
@@ -657,9 +703,10 @@ PowerPoint で `window` が無い場合（ウィンドウを持たないプレ�
 ### 9.2 確認と文書照合
 
 - キュレーション書き込みと `/com call|set` は、dry-run を除き `confirm: true` を要求する。
-- `expected_document` は任意。指定時は `document`、`full_name`、`full_name` の
+- `expected_document` は任意。指定時は振り向け先の `document`、`full_name`、`full_name` の
   basename を小文字で比較する。一致しなければ `DOCUMENT_MISMATCH`。
-- CLI は `--yes` が無い場合に対話端末を要求し、対象と変更内容を表示して承認を取る。
+- CLI は `--yes` が無い場合に対話端末を要求し、振り向け先の対象と変更内容を表示して承認を取る。
+  指定した `target_id` が失効している場合は承認を求めずに拒否する。
 
 ただし **`confirm` はサーバー側の人間承認ではない**。HTTP API を直接呼ぶローカル
 プロセスは `confirm: true` を送れる。CLI のプロンプトは事故防止のための協調的な
@@ -692,8 +739,8 @@ PowerPoint で `window` が無い場合（ウィンドウを持たないプレ�
 - 出力先: `%LOCALAPPDATA%\office-bridge\logs\bridge.log`（`OFFICE_BRIDGE_LOG_DIR` で変更可）。
 - ローテーション: 2 MB × 3 世代。
 - コンソールにも stderr で出力する。
-- 操作ログ: 操作名、対象アプリ／文書、成否、所要時間。
-- 対象切替ログ: 旧対象 → 新対象、HWND、PID。
+- 操作ログ: 操作名、対象アプリ／文書、`id=target_id`、成否、所要時間。
+- 対象登録ログ: 捕捉・再選択・失効・削除を `id` 付きで記録。失効は理由も残す。
 - 文書本文やセル値は原則として記録しない。
 
 ---
@@ -722,6 +769,7 @@ PowerPoint で `window` が無い場合（ウィンドウを持たないプレ�
 | `OFFICE_BRIDGE_BLOCKED_CALLS` | 空 | 追加のブロック名（カンマ区切り） |
 | `OFFICE_BRIDGE_URL` | 未設定 | CLI が使うブリッジ URL。ホットキー起動時にも子プロセスへ渡す |
 | `OFFICE_BRIDGE_CLI_TIMEOUT` | `180` | CLI の HTTP タイムアウト秒数 |
+| `OFFICE_BRIDGE_TARGET` | 未設定 | CLI が既定で振り向ける `target_id`（`--target` の代わり） |
 
 真偽値は `0` / `false` / `no` / `off` 以外を真として扱う。
 
@@ -748,10 +796,11 @@ PowerPoint で `window` が無い場合（ウィンドウを持たないプレ�
 ホットキー受信時は次の処理を行う。
 
 1. `GetForegroundWindow()` で前景 HWND を取得。
-2. COM ワーカーに対象解決を依頼。
-3. 成功すれば対象を差し替え、ログに記録。
+2. COM ワーカーにそのウィンドウの捕捉（capture）を依頼。
+3. 成功すれば対象をレジストリに登録（既存なら再選択）、`selected_target_id` に設定し、
+   ログに記録。エージェントは `OFFICE_BRIDGE_URL` 付きで起動する。
 4. `OFFICE_BRIDGE_LAUNCH_AGENT` が有効なら、設定されたエージェントを新しい端末で起動。
-5. 失敗時は警告ログとビープ。対象は変更しない。
+5. 失敗時は警告ログとビープ。既存の対象は変更しない。
 
 起動コマンドは `agent_config.load_agent_config()` が返す設定から解決する。既定は
 OpenCode で、`configure.bat` または `office-agent set` で Claude Code / Codex /
@@ -854,8 +903,9 @@ Skill は選択したエージェントのディレクトリ（例: `.opencode/s
 | `NOT_OFFICE_WINDOW` | 409 | 前景が Office 文書ウィンドウではない |
 | `NO_DOCUMENT` | 409 | 文書ウィンドウ／文書が無い |
 | `NO_ACTIVE_SLIDE` | 409 | PowerPoint がスライド表示ではない |
-| `TARGET_NOT_SET` | 409 | 対象未選択 |
-| `TARGET_LOST` | 409 | 文書クローズ／Office 終了などで対象消失 |
+| `TARGET_NOT_SET` | 409 | 既定の対象が未登録 |
+| `TARGET_NOT_FOUND` | 404 | 指定 `target_id` が登録に無い |
+| `TARGET_LOST` | 409 | 文書クローズ／Office 終了などで対象が失効 |
 | `DOCUMENT_MISMATCH` | 409 | `expected_document` と不一致 |
 | `RESOLVE_FAILED` | 409 | COM 対象を解決できない、PowerPoint が曖昧 |
 | `INSTANCE_MISMATCH` | 409 | 前景ウィンドウと COM インスタンスが不一致 |
@@ -871,6 +921,7 @@ Skill は選択したエージェントのディレクトリ（例: `.opencode/s
 | `BRIDGE_UNREACHABLE` | - | CLI がローカルで生成。HTTP には出ない |
 
 `COM_ERROR` の `details` には `type`、`message`、可能なら `hresult`（`0x........`）が入る。
+操作系のエラー（HTTP 500 未満）は `details.target_id` に振り向け先を対象 ID で残す。
 
 ---
 
@@ -878,18 +929,20 @@ Skill は選択したエージェントのディレクトリ（例: `.opencode/s
 
 ### 12.1 自動テスト
 
-`python -m pytest -q` で **140 件成功**（本稿執筆時点）。テストは実際の Office を
+`python -m pytest -q` で **228 件成功**（本稿執筆時点）。テストは実際の Office を
 起動せず、フェイクの COM オブジェクトと FastAPI の `TestClient`、Typer の
 `CliRunner`、`monkeypatch` を使う。
 
 | ファイル | 主な検証内容 |
 | --- | --- |
 | `tests/test_agent_config.py` | プリセット、設定の保存・読込、環境変数／CLI 上書き、Skill 配置、起動コマンド解決 |
-| `tests/test_api.py` | エンベロープ、health / context / capabilities、validation、`/com` の引数伝播 |
-| `tests/test_cli.py` | サブコマンド、書き込み確認、`--yes`、dry-run、JSON 値、終了コード |
+| `tests/test_targets.py` | `TargetRegistry` と `TargetRecord`: ID 採番、捕捉の追加/上書きでない性質、`(pid, full_name)` 重複排除、未保存文書の `hwnd:` キー、再選択で ID 不変、失効理由、失効レコードの保持上限 |
+| `tests/test_api.py` | エンベロープ、health / context / capabilities / targets、`target_id` 振り分けと `TARGET_NOT_FOUND`、validation、`/com` の引数伝播 |
+| `tests/test_cli.py` | サブコマンド、`target` コマンド、`--target` の送信、書き込み確認、`--yes`、dry-run、JSON 値、終了コード |
 | `tests/test_common.py` | `jsonable`、行列検証、文字数切り詰め、文書名照合 |
 | `tests/test_com_expr.py` | 式パーサ（文字列、エスケープ、配列、オブジェクト、エラー） |
 | `tests/test_com_ops.py` | get / call / set、ブロックリスト、ルート、dry-run、未知メンバー |
+| `tests/test_com_worker.py` | フェイク COM での BridgeCore 操作、`_resolve_target` のフォールバック無し、COM 例外時のワーカー継続、`OFFICE_BUSY` 判定 |
 | `tests/test_excel_ops.py` | 範囲読み取り、複数領域、上限、書き込み、寸法不一致、数式拒否、書式コピー／設定 |
 | `tests/test_word_ops.py` | 選択読み取り、挿入、文字数上限、確認 |
 | `tests/test_powerpoint_ops.py` | スライド情報、図形テキスト、タイトル、切り詰め |
@@ -900,8 +953,24 @@ Skill は選択したエージェントのディレクトリ（例: `.opencode/s
 
 `.office-bridge/bridge.stderr.log` には、実機でブリッジを起動し、ホットキーを登録し、
 Excel ブックを対象として捕捉・切替した記録が残っている。これは自動テストではなく
-手動確認の証跡である。Word と PowerPoint の実機操作は、コードとフェイクテストは
-あるが、リポジトリ内に実機ログは無い。
+手動確認の証跡である。Phase 1（複数対象）では追加で次の実機確認を行った
+（テスト用ポート 8799 のブリッジで `target capture --hwnd` を使い、`office` CLI 経由で検証）。
+
+- Word 2 文書（Alpha / Beta）+ Excel + PowerPoint の 4 対象を同時登録し、
+  `--target` で比較読み取り → 要約の書き込みは Beta のみ、参照側は無変更。
+- Excel 範囲読み取り → PowerPoint スライド本文への反映は Deck のみ、Data.xlsx は無変更。
+- 別フォルダの同名 `Same.xlsx` 2 ブックが別 `target_id` として両方登録される
+  （`full_name` 基準の重複排除）。
+- 失効対象・未知 ID への操作は `TARGET_LOST` / `TARGET_NOT_FOUND` で、フォールバック無し。
+- 書き込み先の `--expected-document` 不一致は `DOCUMENT_MISMATCH` で拒否。
+- 26 万セルの読み取りは従来どおり `RANGE_TOO_LARGE`（`details.target_id` 付き）。
+
+同一文書の複数ウィンドウ（Word の `NewWindow`）は IDispatch 経由でメソッドが見つからず、
+`/com` で新しいウィンドウを作れない。このケースは捕捉の重複キー（`hwnd:{hwnd}` フォールバック
+を含む）のユニットテストで担保している。
+
+Word と PowerPoint の日常操作ログは、コードとフェイクテストはあるが、リポジトリ内に
+実機ログは無い。
 
 ### 12.3 テストの空白
 
@@ -952,8 +1021,11 @@ Excel ブックを対象として捕捉・切替した記録が残っている�
   バージョンや UI の実装変更で影響を受ける可能性がある。
 - PowerPoint はタイトルと ROT によるヒューリスティック。同名プレゼン、未保存タイトル、
   複数インスタンスでは解決に失敗することがある。曖昧な場合は推測せずエラーにする。
-- 対象は常に 1 つ。複数文書を同時に保持する API は無い。
-- 対象選択はホットキー経由のみ。`--no-hotkey` では対象を選べない。
+- 複数対象をレジストリで保持する。同名ファイルでもパスが違えば別対象、同一ウィンドウ
+  の再捕捉は同じ ID に寄約される。同一文書の複数ウィンドウ（Word の新ウィンドウ等）は
+  同一対象として扱われる。
+- 通常の対象捕捉はホットキー経由。`--no-hotkey` でも `POST /targets/capture`（HWND 指定、
+  テスト・診断用）で登録できるが、運用としてはホットキーを正とする。
 - ホットキー起動のエージェントはブリッジプロセスのカレントディレクトリで開く。
 
 ### 13.6 API / CLI の細かな不整合
@@ -1008,6 +1080,7 @@ office_bridge/
       api.py                      # FastAPI アプリ、Pydantic モデル、エンベロープ
       hotkey.py                   # RegisterHotKey、メッセージループ
       target.py                   # HWND 判定、OBJID_NATIVEOM、文書解決
+      targets.py                  # TargetRecord / TargetRegistry（COM 非依存）
       com_worker.py               # STA ワーカー、BridgeCore、操作実行
       com_expr.py                 # /com 式パーサ
       operations/
@@ -1043,6 +1116,7 @@ office_bridge/
     test_hotkey.py
     test_powerpoint_ops.py
     test_registry.py
+    test_targets.py
     test_word_ops.py
 ```
 
@@ -1059,43 +1133,42 @@ office_bridge/
 
 ## 15. 拡張候補
 
-現状の設計を壊さずに追加できるもの。
+現状の設計を壊さずに追加できるもの。対象選択 API と複数対象の保持は Phase 1 で
+実装済み（§3.4、§5.1）。
 
-1. **対象選択 API**
-   ホットキー以外の経路（CLI からの対象一覧・選択）を追加する。現状は
-   `select_hwnd` が内部メソッドだけなので、認証と組み合わせた API が必要。
-2. **認証付き loopback API**
+1. **認証付き loopback API**
    ランダムトークンを起動時に生成し、CLI と子プロセスに渡す。`confirm` の
    協調性を強化できる。
-3. **複数対象の保持**
-   対象 ID を導入し、文書ごとのハンドルを保持する。COM 参照の寿命管理が複雑になる。
-4. **実機統合テスト**
+2. **実機統合テスト**
    Office を起動した状態で、Excel / Word / PowerPoint の読み書きを自動検証する。
    テスト用文書を用意し、保存・クローズはテスト側で行う。
-5. **配布用パッケージ**
+3. **配布用パッケージ**
    PyInstaller 等で `office-bridge` と `office` を単体実行ファイル化する。
-6. **読み取りサイズ制御の強化**
+4. **読み取りサイズ制御の強化**
    `/com get` のコレクション結果にも上限を設ける。ページングや件数指定を追加する。
-7. **PowerPoint 対象解決の改善**
+5. **PowerPoint 対象解決の改善**
    ウィンドウハンドルとプレゼンテーションの対応をより直接的に取る。
-8. **監査ログ**
+6. **監査ログ**
    操作名、対象、変更内容のハッシュ、承認者などを構造化して記録する。
-9. **CLI の不足オプション**
+7. **CLI の不足オプション**
    `--underline` など、バックエンドが受け付ける書式オプションを CLI に追加する。
-10. **ロールバック／アンドゥ連携**
+8. **ロールバック／アンドゥ連携**
     書式設定の部分適用を避けるため、変更前の値を取得して復元する仕組みを検討する。
+9. **Office 以外アプリの対象化（roadmap Phase 2）**
+   Outlook やブラウザ・PDF など Office 以外の対象種別を追加する。`AppKind` と
+   キャプチャ経路の拡張で対応できる形にしているが、Phase 1 では意図的に手付けていない。
 
 ---
 
 ## 付録: 代表的な処理フロー
 
-### A. ホットキーで対象を選ぶ
+### A. ホットキーで対象を捕捉する
 
 ```text
 ユーザー: Ctrl+Alt+O
   → hotkey thread: GetForegroundWindow()
-  → BridgeCore.select_foreground()
-  → COM worker: _select_hwnd(hwnd)
+  → BridgeCore.capture_foreground()
+  → COM worker: _capture_hwnd(hwnd)
       → resolve_target(hwnd)
           → トップレベル HWND / クラス / PID / EXE
           → Excel: EXCEL7 → AccessibleObjectFromWindow → Application / ActiveSheet.Parent
@@ -1103,9 +1176,10 @@ office_bridge/
           → PPT:   タイトル / ROT → Presentation → Windows(1)
           → Application.Hwnd などの整合性チェック
       → target.refresh_info()
-      → _target を差し替え、summary をキャッシュ
+      → registry に捕捉（新規 ID か再選択かを重複キーで判定）
+      → _com_refs に COM 参照を保存、selected_target_id に設定、summary をキャッシュ
   → 成功: ログ、必要なら設定されたエージェントを起動
-  → 失敗: 警告ログ、ビープ、対象は変更しない
+  → 失敗: 警告ログ、ビープ、既存の対象は変更しない
 ```
 
 ### B. Excel の範囲を読む
