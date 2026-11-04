@@ -196,14 +196,21 @@ office --target t-99aa88bb7766 excel range write A1:B2 --json ... --yes
 
 ### M5: 安全性・統合テストとドキュメント
 
-- 手動統合チェックリスト（実機）：
-  - [ ] 文書閉じ後の全操作が安全に失敗
-  - [ ] 同名ファイル（別フォルダ）・同一文書の複数ウィンドウ
-  - [ ] 対象 ID 誤指定・存在しない ID
-  - [ ] 書き込み確認・dry-run・`expected_document`
-  - [ ] 長い読み取り結果とタイムアウト
-  - [ ] COM エラー後のワーカー継続性
-- `docs/implementation.md` に「対象レジストリ」章を追加、README 更新
+- 手動統合チェックリスト（実機、2026-11-04 にポート 8799 のブリッジで実施）：
+  - [x] 文書閉じ後の全操作が安全に失敗（`window_gone` で `expired` 化、操作は
+    `TARGET_LOST`、他対象へのフォールバック無し。閉じた対象の成功ログも無し）
+  - [x] 同名ファイル（別フォルダ）→ 別 `target_id` で 2 件登録を確認。同一文書の
+    複数ウィンドウは `/com` で `NewWindow` が参照できず実機不可。重複キー設計の
+    ユニットテストで担保（`implementation.md` §12.2 参照）
+  - [x] 存在しない ID → `TARGET_NOT_FOUND`（404 / CLI 終了コード 1）
+  - [x] 書き込み確認・dry-run・`expected_document`（M4 ワークフローで dry-run→
+    `--yes`、意図的ミスマッチで `DOCUMENT_MISMATCH` 拒否を確認）
+  - [x] 長い読み取り結果は上限超過で `RANGE_TOO_LARGE`（26 万セル、
+    `details.target_id` 付き）。タイムアウト経路は実機で再現せず（ユニットで担保）
+  - [x] COM エラー後のワーカー継続性（実機ログ: `com_reference_lost` 後も他対象の
+    操作が成功し続けている。ユニット: `test_com_worker.py`）
+- `docs/implementation.md` に対象レジストリの記述を反映（§2.2、§3.4、§4.3–4.4、
+  §5、§6、§9、§10、§11、§12、§14–15）、README 更新
 
 ---
 
