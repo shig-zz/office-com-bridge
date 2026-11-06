@@ -1,6 +1,6 @@
 # Office COM Bridge
 
-[English](README.md) | 日本語
+English | [日本語](README.ja.md)
 
 Local HTTP and CLI bridge between AI agents and running Microsoft Office
 desktop applications. Capture live Word, Excel, or PowerPoint windows with a

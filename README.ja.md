@@ -1,6 +1,6 @@
 # Office COM Bridge
 
-English | [日本語](README.ja.md)
+[English](README.md) | 日本語
 
 AIエージェントと、起動中のMicrosoft Officeデスクトップアプリをつなぐローカルブリッジです。HTTPとCLIから操作できます。
 
