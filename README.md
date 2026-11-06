@@ -1,5 +1,7 @@
 # Office COM Bridge
 
+[English](README.md) | 日本語
+
 Local HTTP and CLI bridge between AI agents and running Microsoft Office
 desktop applications. Capture live Word, Excel, or PowerPoint windows with a
 hotkey; each becomes a **registered target** with its own `target_id`, and
