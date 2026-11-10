@@ -125,6 +125,11 @@ Rules for formatting writes:
 
 - `copy-format` copies only formatting; the target keeps its own values. The
   source and target ranges must have identical dimensions.
+- In this build `copy-format` does not propagate cell borders: a solid edge
+  border on the source (for example the bottom rule of `H78`) can stay missing
+  on the target (`H82`) after the copy. Font, fill, and number format do travel;
+  borders do not. After copying, verify borders cell by cell and restore them
+  with `com set` (see "Reading and writing borders") or `set-format --border`.
 - Prefer `copy-format` from a well-formatted reference cell over guessing many
   `set-format` options.
 - Excel has no separate far-east font option: choose `--font-name` with a
@@ -143,6 +148,33 @@ Colors are BGR integers (for example 16446960 is `FAF5F0`); when a fix must
 match an existing look, reuse a value read from the sheet itself. Setting a
 fill on a range that has no fill yet (`Interior.Pattern` = -4142) works with
 `Interior.Color` alone — the pattern becomes solid automatically.
+
+`Interior.Color` reports the static fill only, never conditional-formatting
+results. Before diagnosing a fill mismatch, check `Range("...").FormatConditions.Count`:
+a stale static fill under a CF-covered cell still shows where the CF rule does
+not match (typically empty cells).
+
+Reading and writing borders:
+
+`Borders(n)` indexes positions — left=7, top=8, bottom=9, right=10, inside
+vertical=11, inside horizontal=12 — not LineStyle enum values. Passing a -41xx
+enum as the index raises a COM exception or returns misleading values. As with
+fills, multi-cell border reads are only a uniformity test; read borders cell by
+cell.
+
+To reproduce an existing rule exactly, read the stored values and set them back
+through `com set` (`set-format --border` only sets a continuous line and a
+color, never the weight):
+
+```text
+office com get 'document.Sheets(1).Range("H40").Borders(9).LineStyle'  # 1 = xlContinuous
+office com get 'document.Sheets(1).Range("H40").Borders(9).Weight'     # raw stored value: 2 thin, 4 medium, -4138 hairline
+office com set 'document.Sheets(1).Range("H80").Borders(9).Weight' --value 4 --yes --expected-document "Budget.xlsx"
+```
+
+Re-set exactly the Weight and Color (BGR integer) read from the sheet. A
+multi-row range's `Borders(9)` touches only the bottom edge of the whole range;
+to give every row its own bottom rule, call it on each single-row range.
 
 Excel hyperlinks:
 
@@ -365,7 +397,7 @@ around the blocklist (for example via a macro).
   - `TARGET_NOT_SET`: nothing is captured yet; ask the user to press the hotkey on an Office window.
   - `TARGET_NOT_FOUND`: the `--target` id is not registered; re-run `office target list`, do not guess.
   - `NOT_OFFICE_WINDOW`: the focused window was not an Office document window.
-  - `TARGET_LOST`: the target's document closed (`details.reason` says why); ask the user to reopen it and press the hotkey. Never retry against a different target.
+  - `TARGET_LOST`: the target's document closed (`details.reason` says why); ask the user to reopen it and press the hotkey. Never retry against a different target. After the user re-captures, first read back the document to confirm writes applied earlier are still present (the document may have been reloaded or undone), then re-run pending writes against the new target id — dry-run again, do not reuse the old id.
   - `DOCUMENT_MISMATCH`: the routed target's document is not the one named in `--expected-document`; the ids/paths in `details` show which is which.
   - `CONFIRMATION_REQUIRED`: call again with `--yes` only after user approval.
   - `OPERATION_BLOCKED`: the operation is save/close family; ask the user to do it in Office.
