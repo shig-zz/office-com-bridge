@@ -10,6 +10,7 @@ blocked. Additional names can be blocked with OFFICE_BRIDGE_BLOCKED_CALLS.
 
 from __future__ import annotations
 
+import difflib
 from typing import Any
 
 import pywintypes
@@ -110,7 +111,9 @@ def execute(
         )
     if mode in ("get", "set") and last.args is not None:
         raise invalid_request(
-            f"A {mode!r} expression must end with a property name (no call arguments).",
+            f"A {mode!r} expression must end with a property name (no call arguments). "
+            "To read a parameterized property, end the expression with the property "
+            "name it exposes, or use 'com call' with the arguments.",
             {"expression": _render(segments)},
         )
     if mode == "set" and value is None:
@@ -132,14 +135,24 @@ def execute(
     if mode == "get":
         result = _walk(root_object, segments)
         truncated = False
+        note: str | None = None
+        if callable(result):
+            note = (
+                "The value is a callable member (some Office members are parameterized "
+                "properties). Read it with a 'call' expression, for example "
+                f"'{_render(segments)}(...)', or use the property it exposes."
+            )
         if isinstance(result, str) and settings.max_text_chars > 0:
             result, truncated = truncate_text(result, settings.max_text_chars)
-        return {
+        payload = {
             "mode": "get",
             "root": root,
             "value": jsonable(result),
             "truncated": truncated,
         }
+        if note:
+            payload["note"] = note
+        return payload
 
     if not dry_run:
         require_confirm(params, f"com.{mode}")
@@ -171,16 +184,17 @@ def execute(
             "method": last.name,
             "arguments": [jsonable(item) for item in last_args],
             "result": jsonable(result),
+            "unsaved_changes": _unsaved_changes(target),
         }
         if resolved_notes:
             payload["resolved_arguments"] = resolved_notes
         return payload
 
     owner = _walk(root_object, segments[:-1])
-    _member(owner, last.name)
     com_value = _com_value(value)
     if dry_run:
-        return {
+        member = _member(owner, last.name)
+        preview = {
             "mode": "set",
             "root": root,
             "dry_run": True,
@@ -188,10 +202,27 @@ def execute(
             "property": last.name,
             "value": jsonable(com_value),
         }
+        if callable(member):
+            preview["applied_via"] = "parameterized_property"
+        return preview
+    applied_via = "property"
     try:
         setattr(owner, last.name, com_value)
-    except pywintypes.com_error as exc:
-        raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+    except (AttributeError, pywintypes.com_error) as exc:
+        if not _is_unknown_member_error(exc):
+            raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+        # The name is not reachable as a plain property; some Office members are
+        # parameterized properties and are set by calling them with the value.
+        member = _member(owner, last.name)
+        if not callable(member):
+            raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+        try:
+            member(com_value)
+        except Exception as call_exc:
+            raise com_error(
+                f"The COM property {last.name!r} could not be set.", call_exc
+            ) from call_exc
+        applied_via = "parameterized_property"
     except Exception as exc:
         raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
     return {
@@ -201,6 +232,8 @@ def execute(
         "applied": True,
         "property": last.name,
         "value": jsonable(com_value),
+        "applied_via": applied_via,
+        "unsaved_changes": _unsaved_changes(target),
     }
 
 
@@ -269,14 +302,87 @@ def _member(owner: Any, name: str) -> Any:
     try:
         return getattr(owner, name)
     except AttributeError as exc:
-        raise _unknown_member(name, exc) from exc
+        raise _unknown_member(owner, name, exc) from exc
     except pywintypes.com_error as exc:
-        hresult = int(getattr(exc, "hresult", 0) or 0) & 0xFFFFFFFF
-        if hresult in _UNKNOWN_MEMBER_HRESULTS:
-            raise _unknown_member(name, exc) from exc
+        if _is_unknown_member_error(exc):
+            raise _unknown_member(owner, name, exc) from exc
         raise com_error(f"The COM member {name!r} could not be read.", exc) from exc
     except Exception as exc:
         raise com_error(f"The COM member {name!r} could not be read.", exc) from exc
+
+
+def _is_unknown_member_error(exc: BaseException) -> bool:
+    if isinstance(exc, AttributeError):
+        return True
+    hresult = int(getattr(exc, "hresult", 0) or 0) & 0xFFFFFFFF
+    return hresult in _UNKNOWN_MEMBER_HRESULTS
+
+
+def _is_callable_member(owner: Any, name: str) -> bool:
+    try:
+        return callable(getattr(owner, name))
+    except Exception:
+        return False
+
+
+def _unsaved_changes(target: ResolvedTarget) -> bool | None:
+    """Report whether the attached document has unsaved changes (None if unknown)."""
+    try:
+        saved = target.document.Saved
+    except Exception:
+        return None
+    try:
+        return not bool(saved)
+    except Exception:
+        return None
+
+
+def _member_candidates(owner: Any, name: str, limit: int = 12) -> list[str]:
+    names: list[str] = []
+    try:
+        names.extend(str(item) for item in dir(owner))
+    except Exception:
+        pass
+    for attribute in ("_propnames", "_methods_"):
+        try:
+            names.extend(str(item) for item in getattr(owner, attribute) or ())
+        except Exception:
+            continue
+    unique = sorted({item for item in names if item and not item.startswith("_")})
+    if not unique:
+        return []
+    close = difflib.get_close_matches(name, unique, n=limit, cutoff=0.5)
+    if len(close) < limit:
+        prefix = name.lower()[: max(2, len(name) - 1)]
+        close.extend(item for item in unique if item.lower().startswith(prefix) and item not in close)
+    return close[:limit]
+
+
+def _member_hint(owner: Any, name: str) -> str | None:
+    lowered = name.lower()
+    if lowered == "text" and _is_callable_member(owner, "TextRange"):
+        return (
+            "This object exposes TextRange: read or write TextRange.Text instead. "
+            "On some Office objects the plain name is a parameterized property and is "
+            "not reachable as a property."
+        )
+    return (
+        "Some Office members are parameterized properties: read them with a 'call' "
+        "expression that passes the arguments, or use the property they expose."
+    )
+
+
+def _unknown_member(owner: Any, name: str, exc: BaseException) -> BridgeError:
+    details: dict[str, Any] = {"member": name, "error": str(exc)}
+    candidates = _member_candidates(owner, name)
+    if candidates:
+        details["did_you_mean"] = candidates
+    hint = _member_hint(owner, name)
+    if hint:
+        details["hint"] = hint
+    return invalid_request(
+        f"Member {name!r} was not found on the target object.", details
+    )
 
 
 def _call(member: Any, segment: Segment) -> Any:
@@ -287,13 +393,6 @@ def _call(member: Any, segment: Segment) -> Any:
         raise com_error(f"The COM call {segment.name!r} failed.", exc) from exc
     except Exception as exc:
         raise com_error(f"The COM call {segment.name!r} failed.", exc) from exc
-
-
-def _unknown_member(name: str, exc: BaseException) -> BridgeError:
-    return invalid_request(
-        f"Member {name!r} was not found on the target object.",
-        {"member": name, "error": str(exc)},
-    )
 
 
 def _placement_sheets(owner: Any) -> Any | None:

@@ -61,6 +61,7 @@ Prefer the narrowest read that answers the question. The examples below omit
 | Word selected text | `office word selection read` |
 | Word document counts | `office word document read` |
 | Current PowerPoint slide and shapes | `office powerpoint slide inspect` |
+| PowerPoint slides with notes and shape geometry | `office powerpoint slides read --start 1 --count 20` |
 | PowerPoint slide titles | `office powerpoint document read` |
 
 The bridge limits large reads (default: 10,000 cells and 100,000 text characters). If `RANGE_TOO_LARGE` or `TEXT_TOO_LARGE` is returned, request a smaller range or a smaller excerpt. Do not retry the same request.
@@ -230,6 +231,76 @@ office word selection insert-text "追記します。" --yes --expected-document
 
 `--replace` is the default; use `--no-replace` only when the user explicitly wants insertion at the start of the selection.
 
+PowerPoint slide text:
+
+PowerPoint text edits have curated commands; prefer them over hand-built `com`
+expressions. On this Office build the object model behaves as follows:
+
+- Read the whole deck (slides, speaker notes, and every shape's index, name, and
+  `Left`/`Top`/`Width`/`Height` in points) before planning edits:
+
+  ```text
+  office --target t-PPTYYY powerpoint slides read --start 1 --count 20
+  ```
+
+  Up to 100 slides per call; the response says `slide_width`/`slide_height` and
+  marks all geometry `"unit": "pt"`.
+- Fix wording in place with `text replace`; it uses `TextRange.Replace`, keeps
+  run formatting, and never touches the layout. Dry-run reports `occurrences`
+  (0 means the text is not on that shape); the run reads the shape back and
+  returns `verified` and a `text_preview`:
+
+  ```text
+  office --target t-PPTYYY powerpoint text replace 25 --shape 2 --find "回転行列は直交する" --replace "回転行列は直交行列である" --dry-run --expected-document "Deck.pptx"
+  office --target t-PPTYYY powerpoint text replace 25 --shape 2 --find "回転行列は直交する" --replace "回転行列は直交行列である" --yes --expected-document "Deck.pptx"
+  ```
+
+  `--shape` takes a 1-based index or a shape name (`"TextBox 7"`), read from
+  `powerpoint slides read`. Long or multi-line replacement text goes through a
+  file: `--replace @note.txt` (UTF-8).
+- Add a band of commentary in its own box with `textbox add`. Geometry is in
+  points (same units as `slide_width`/`slide_height`). Dry-run says whether the
+  box fits the slide (`fits_in_slide`); the run returns the created shape's
+  `index`, `id`, and `name`, so later commands never guess the index:
+
+  ```text
+  office --target t-PPTYYY powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "※補足…" --font-size 12 --dry-run --expected-document "Deck.pptx"
+  office --target t-PPTYYY powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "※補足…" --font-size 12 --yes --expected-document "Deck.pptx"
+  ```
+
+- Add slides with `powerpoint slide add [--index N]` (default: append, Title and
+  Content layout); the response lists the new slide's placeholder shapes.
+- Check the autofit before appending a paragraph to an existing placeholder: one
+  set to shrink text on overflow shrinks *every* line in that placeholder. Put the
+  addition in its own text box in a free band instead; `powerpoint slides read`
+  shows every shape's rectangle so nothing overlaps and the box stays inside the
+  slide.
+- Raw COM caveats still apply to hand-built expressions:
+  - `TextFrame.Text` is unreadable by `com get` on this build ("Member 'Text' was
+    not found"); read and write through
+    `document.Slides(n).Shapes(k).TextFrame.TextRange.Text` instead. The same
+    applies to `TextRange.Paragraphs.Count`; count CR characters in the returned
+    text instead.
+  - Reading `TextRange.Text` returns CR (13) between paragraphs and vertical tab
+    (11) where the deck has a soft line break. `com set` on it with real CR
+    characters creates one paragraph per line.
+  - `Shapes.AddTextbox(1, …)` also takes **points**, not EMU.
+- When a `com` name is rejected, the error's `details.did_you_mean` lists the
+  real member names on that object and `details.hint` points at the usual
+  substitute (for example `TextRange` for `Text`). Read the candidates instead
+  of guessing another name.
+
+Batching calls in a shell:
+
+- PowerShell variable names are case-insensitive. Storing the target id in `$t`
+  and a shape's `Top` in `$T` in the same loop silently overwrites the id, and the
+  remaining calls go to the wrong target. Use distinct, longer names (`$tid`,
+  `$top`).
+- Offline inspection of the saved file (shape order, geometry, text) is fine for
+  planning, but its shape numbering matches COM `Shapes(k)` only while nobody has
+  reordered shapes: read the target text back with `com get` immediately before
+  each write and confirm it is the string you expect.
+
 ## Working across several documents
 
 The bridge routes each command to one registered `target_id`; comparing, merging,
@@ -306,6 +377,10 @@ office com set 'window.Selection.Font.Bold' --value true
 - `com call EXPR` — call a method (write workflow applies). EXPR ends with `(arguments)`.
 - `com set EXPR --value V` — set a property (write workflow applies). EXPR ends with a property name. V is JSON (`42`, `true`, `"text"`, `[[1,2],[3,4]]`) or a plain string.
   - A two-dimensional value array for `Value2` (for example `[[1,2],[3,4]]`) is passed to COM as a tuple of tuples (the same shape `excel.range.write` uses), so it lands in the individual cells correctly. Scalars and one-dimensional arrays are passed through unchanged.
+  - `--value @path` reads the value from a UTF-8 file instead of the command line. Use it for long or multi-line text (especially Japanese) so shell quoting and code pages cannot corrupt it. `--replace @path` and `--text @path` on the PowerPoint commands work the same way.
+  - String literals in expressions support `\n`, `\t`, `\r`, `\v` (vertical tab), `\/`, and `\uXXXX`, so PowerPoint paragraphs and soft line breaks can be written without putting raw control characters on the command line.
+- When a member name is rejected, `error.details.did_you_mean` lists the real member names on that object and `error.details.hint` suggests the standard substitute. Use them; do not guess more names.
+- `com set` reports `applied_via: "parameterized_property"` when the name was set by calling it (Office parameterized properties), and executed writes report `unsaved_changes: true/false` from the document's `Saved` flag — pass that on to the user, who must save in Office.
 
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
 xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,

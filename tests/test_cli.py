@@ -384,6 +384,175 @@ def test_com_set_rejects_null_value(monkeypatch) -> None:
     assert client.com_calls == []
 
 
+def test_com_set_value_from_utf8_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "note.txt"
+    raw = "日本語メモ\n段落区切り"
+    path.write_text(raw, encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app, ["com", "set", "TextRange.Text", "--value", f"@{path}", "--yes"]
+    )
+    assert result.exit_code == 0
+    assert client.com_calls[0][3] == raw
+
+
+def test_com_set_value_from_json_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "values.json"
+    path.write_text("[[1, 2], [3, 4]]", encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app, ["com", "set", 'Range("A1:B2").Value2', "--value", f"@{path}", "--yes"]
+    )
+    assert result.exit_code == 0
+    assert client.com_calls[0][3] == [[1, 2], [3, 4]]
+
+
+def test_com_set_value_missing_file_fails(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["com", "set", "TextRange.Text", "--value", f"@{tmp_path / 'nope.txt'}", "--yes"],
+    )
+    assert result.exit_code != 0
+    assert client.com_calls == []
+
+
+def test_powerpoint_slides_read_passes_window(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "slides", "read", "--start", "21", "--count", "10"]
+    )
+    assert result.exit_code == 0
+    assert captured == {"kind": "powerpoint.slides", "params": {"start": 21, "count": 10}}
+
+
+def test_powerpoint_text_replace_with_yes_sends_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "text", "replace", "3",
+            "--shape", "7",
+            "--find", "1979",
+            "--replace", "1982",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.text.replace"
+    assert params == {
+        "slide": 3,
+        "shape": 7,
+        "find": "1979",
+        "replace": "1982",
+        "dry_run": False,
+        "confirm": True,
+    }
+
+
+def test_powerpoint_text_replace_keeps_shape_name_as_string(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "text", "replace", "3",
+            "--shape", "TextBox 7",
+            "--find", "a",
+            "--replace", "b",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    _, params = client.invocations[0]
+    assert params["shape"] == "TextBox 7"
+    assert params["dry_run"] is True
+    assert "confirm" not in params
+
+
+def test_powerpoint_text_replace_value_from_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "replacement.txt"
+    path.write_text("置換後テキスト", encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "text", "replace", "3",
+            "--shape", "2",
+            "--find", "old",
+            "--replace", f"@{path}",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    assert client.invocations[0][1]["replace"] == "置換後テキスト"
+
+
+def test_powerpoint_textbox_add_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "textbox", "add", "3",
+            "--left", "20",
+            "--top", "460",
+            "--width", "920",
+            "--height", "60",
+            "--text", "補足",
+            "--font-size", "12",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.textbox.add"
+    assert params["left"] == 20.0
+    assert params["top"] == 460.0
+    assert params["text"] == "補足"
+    assert params["font_size"] == 12.0
+    assert params["confirm"] is True
+
+
+def test_powerpoint_slide_add_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "slide", "add", "--index", "70", "--yes"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.slide.add"
+    assert params["index"] == 70
+    assert "layout" not in params
+    assert params["confirm"] is True
+
+
+def test_powerpoint_slide_add_appends_without_index(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["powerpoint", "slide", "add", "--dry-run"])
+    assert result.exit_code == 0
+    _, params = client.invocations[0]
+    assert "index" not in params
+    assert params["dry_run"] is True
+
+
 def test_load_values_accepts_values_object() -> None:
     assert cli._load_values('{"values": [[1, 2]]}', None) == [[1, 2]]
 

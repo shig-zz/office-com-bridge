@@ -25,11 +25,16 @@ _ESCAPES = {
     "n": "\n",
     "t": "\t",
     "r": "\r",
+    "v": "\v",
     "0": "\0",
     "\\": "\\",
+    "/": "/",
     "'": "'",
     '"': '"',
 }
+
+# Unicode escape (\uXXXX) length, handled separately from the table above.
+_UNICODE_ESCAPE_LENGTH = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +170,19 @@ def _parse_string(text: str, pos: int) -> tuple[str, int]:
             if pos + 1 >= len(text):
                 raise _fail(pos, "unterminated escape in string literal")
             escape = text[pos + 1]
+            if escape == "u":
+                digits = text[pos + 2 : pos + 2 + _UNICODE_ESCAPE_LENGTH]
+                if len(digits) < _UNICODE_ESCAPE_LENGTH or any(
+                    digit not in "0123456789abcdefABCDEF" for digit in digits
+                ):
+                    raise _fail(
+                        pos,
+                        "\\u must be followed by four hex digits in string literal",
+                        {"escape": f"\\u{digits}"},
+                    )
+                parts.append(chr(int(digits, 16)))
+                pos += 2 + _UNICODE_ESCAPE_LENGTH
+                continue
             if escape not in _ESCAPES:
                 raise _fail(pos, f"unsupported escape '\\{escape}' in string literal")
             parts.append(_ESCAPES[escape])

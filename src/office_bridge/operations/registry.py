@@ -61,6 +61,15 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
         _require_app(target, AppKind.POWERPOINT, kind)
         return powerpoint.document(target, max_text_chars=settings.max_text_chars)
 
+    if kind == "powerpoint.slides":
+        _require_app(target, AppKind.POWERPOINT, kind)
+        return powerpoint.slides(
+            target,
+            start=params.get("start", 1),
+            count=params.get("count", 20),
+            max_text_chars=settings.max_text_chars,
+        )
+
     raise unsupported_operation(kind)
 
 
@@ -153,6 +162,48 @@ def invoke(
             params=params,
         )
 
+    if operation == "powerpoint.text.replace":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.text_replace(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            find=params.get("find"),
+            replacement=params.get("replace"),
+            dry_run=dry_run,
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
+    if operation == "powerpoint.textbox.add":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.textbox_add(
+            target,
+            slide_index=params.get("slide"),
+            left=params.get("left"),
+            top=params.get("top"),
+            width=params.get("width"),
+            height=params.get("height"),
+            text=params.get("text"),
+            font_size=params.get("font_size"),
+            dry_run=dry_run,
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
+    if operation == "powerpoint.slide.add":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.slide_add(
+            target,
+            index=params.get("index"),
+            layout=params.get("layout"),
+            dry_run=dry_run,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -241,6 +292,21 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "mode": "read",
                 "description": "Read presentation metadata and slide titles.",
                 "params": {},
+            },
+            {
+                "name": "powerpoint.slides",
+                "applications": ["PowerPoint"],
+                "mode": "read",
+                "description": (
+                    "Read a window of slides with speaker notes and every shape "
+                    "(index, id, name, type, text, and left/top/width/height "
+                    "geometry in points). Use it to plan text edits without "
+                    "reading the file directly."
+                ),
+                "params": {
+                    "start": {"type": "number", "required": False, "note": "1-based slide number, default 1."},
+                    "count": {"type": "number", "required": False, "note": "Slides to read, default 20, max 100."},
+                },
             },
         ],
         "operations": [
@@ -369,6 +435,69 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                     "fill": {"type": "string", "required": False, "format": "RRGGBB"},
                     "border": {"type": "boolean|string", "required": False, "values": [True, "continuous"]},
                     "border_color": {"type": "string", "required": False, "format": "RRGGBB"},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.text.replace",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Replace text inside one shape's text frame in place with "
+                    "TextRange.Replace, so formatting and layout are preserved. "
+                    "Dry-run reports how many times the text occurs; the run "
+                    "reads the shape back and returns 'verified' plus a preview."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                    "find": {"type": "string", "required": True},
+                    "replace": {"type": "string", "required": True, "note": "Replacement text (empty string deletes)."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.textbox.add",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Add a text box to a slide. Geometry is in points (matches "
+                    "Left/Top/Width/Height, not EMU). Dry-run reports whether the "
+                    "box fits the slide; the run returns the created shape's "
+                    "index, id, and name so later calls do not have to guess."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "left": {"type": "number", "required": True, "note": "Points from the slide's left edge."},
+                    "top": {"type": "number", "required": True, "note": "Points from the slide's top edge."},
+                    "width": {"type": "number", "required": True},
+                    "height": {"type": "number", "required": True},
+                    "text": {"type": "string", "required": True},
+                    "font_size": {"type": "number", "required": False, "note": "Optional point size."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.slide.add",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Add a new slide at a 1-based position (default: end) with a "
+                    "layout number (default 2, Title and Content). Returns the "
+                    "new slide's index and its placeholder shapes."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "index": {"type": "number", "required": False, "note": "1-based insertion position; omit to append."},
+                    "layout": {"type": "number", "required": False, "note": "ppSlideLayout number, default 2."},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},

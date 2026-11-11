@@ -98,6 +98,10 @@ office excel range add-hyperlink E35 --url "https://example.com/" --yes
 office word selection read
 office word selection insert-text "Replacement" --yes
 office powerpoint slide inspect
+office powerpoint slides read --start 1 --count 20
+office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
+office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "Note" --yes
+office powerpoint slide add --index 70 --yes
 office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
@@ -168,6 +172,15 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   Optional `sub_address` (anchor or sheet reference) and `screen_tip` (tooltip)
   are supported; formula-style strings beginning with `=` are rejected
 - `word.selection.insert_text`
+- `powerpoint.text.replace` replaces text inside one shape's text frame with
+  `TextRange.Replace`, keeping run formatting and layout. Dry-run reports the
+  occurrence count; the run reads the shape back and returns `verified`
+- `powerpoint.textbox.add` adds a text box to a slide using point geometry
+  (matching `Left`/`Top`/`Width`/`Height`, not EMU). Dry-run checks
+  `fits_in_slide`; the run returns the created shape's `index`, `id`, and `name`
+- `powerpoint.slide.add` inserts a slide at a 1-based position (default: end)
+  with a layout number (default 2, Title and Content) and returns the new
+  slide's placeholders
 - `excel.active_sheet` through `/set-property`
 
 Write operations support `dry_run` and, except for dry runs, require `confirm`.
@@ -190,6 +203,15 @@ expression chaining members, for example:
 from `value`. The leading root segment in the expression selects the root when
 no conflicting `root` is given. `call` and `set` support `dry_run` and, except
 for dry runs, require `confirm`.
+
+Unknown member names come back as `INVALID_REQUEST` with `details.did_you_mean`
+(candidate member names on the target object) and `details.hint` (the standard
+substitute, for example `TextRange.Text` for `TextFrame.Text`). In CLI syntax,
+string literals support `\n`, `\t`, `\r`, `\v` (vertical tab), `\/`, and
+`\uXXXX`, and `com set --value @path` loads the value from a UTF-8 file so long
+or multi-line text survives shell quoting and code pages. Executed `call` and
+`set` results report `unsaved_changes`, whether the document now has
+unsaved edits.
 
 Only saving and closing are intentionally unavailable: member names starting
 with `save` or `close` (plus `quit` and `exit`) are rejected with

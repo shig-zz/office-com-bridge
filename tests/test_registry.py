@@ -50,6 +50,50 @@ def test_operations_listed_in_capabilities() -> None:
     assert "excel.range.write" in names
     assert "word.selection.insert_text" in names
     assert "excel.range.add_hyperlink" in names
+    assert "powerpoint.text.replace" in names
+    assert "powerpoint.textbox.add" in names
+    assert "powerpoint.slide.add" in names
+    inspections = [item["name"] for item in cap["inspections"]]
+    assert "powerpoint.slides" in inspections
+
+
+def test_slides_inspection_dispatches_to_powerpoint() -> None:
+    from test_powerpoint_ops import FakeSlide
+    from test_powerpoint_ops import make_target as make_deck_target
+
+    deck = make_deck_target([FakeSlide(1, "One", "body", notes="n1")])
+    result = registry.inspect(deck, "powerpoint.slides", {"start": 1, "count": 5}, _settings)
+    assert result["unit"] == "pt"
+    assert result["slides"][0]["slide_index"] == 1
+    assert result["slides"][0]["notes"] == "n1"
+
+
+def test_slides_inspection_requires_powerpoint() -> None:
+    with pytest.raises(BridgeError) as excinfo:
+        registry.inspect(make_target(AppKind.EXCEL), "powerpoint.slides", {}, _settings)
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+
+
+def test_powerpoint_text_replace_dispatches_to_operation() -> None:
+    from test_powerpoint_ops import FakeSlide
+    from test_powerpoint_ops import make_target as make_deck_target
+
+    deck = make_deck_target([FakeSlide(1, "Title", "alpha 1963")])
+    result = registry.invoke(
+        deck,
+        "powerpoint.text.replace",
+        {"slide": 1, "shape": 2, "find": "1963", "replace": "1968", "confirm": True},
+        _settings,
+    )
+    assert result["verified"] is True
+    assert deck.document.Slides(1).Shapes(2).TextFrame.TextRange.Text == "alpha 1968"
+
+
+def test_powerpoint_write_requires_powerpoint_app() -> None:
+    for operation in ("powerpoint.text.replace", "powerpoint.textbox.add", "powerpoint.slide.add"):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(make_target(AppKind.WORD), operation, {}, _settings)
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
 
 
 def test_add_hyperlink_dispatches_to_excel_operation() -> None:

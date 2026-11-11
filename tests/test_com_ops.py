@@ -19,6 +19,8 @@ class Node:
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_members", dict(members or {}))
         object.__setattr__(self, "_call_result", call_result)
+        # pywintypes COM objects expose their member names this way.
+        object.__setattr__(self, "_propnames", sorted(members or {}))
         self.calls: list[tuple] = []
         self.sets: dict[str, Any] = {}
 
@@ -465,3 +467,89 @@ def test_call_dry_run_previews_resolved_arguments() -> None:
     result = run("call", "document.Sheets(7).Copy(8)", target, root="document", dry_run=True)
     assert nodes["copy"].calls == []
     assert result["resolved_arguments"] == [{"position": 0, "argument": 8, "sheet": "2026年11月"}]
+
+
+class ParamNode(Node):
+    """COM-like fake: a parameterized property is callable but refuses assignment."""
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        members = self.__dict__["_members"]
+        if key in members and callable(members[key]):
+            raise AttributeError(f"{self._name} does not allow setting {key!r}")
+        super().__setattr__(key, value)
+
+
+def make_textframe_target(**kwargs: Any) -> SimpleNamespace:
+    textframe = kwargs.get("textframe") or Node(
+        "textframe",
+        {"TextRange": Node("tr"), "MarginLeft": 0, "WordWrap": True},
+    )
+    shape = Node("shape", {"TextFrame": textframe})
+    window = Node("window", {"Selection": shape})
+    return make_target(window=window)
+
+
+def test_unknown_member_get_suggests_candidates() -> None:
+    target = make_textframe_target()
+    with pytest.raises(BridgeError) as excinfo:
+        run("get", "Selection.TextFrame.Text", target)
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    assert "TextRange" in excinfo.value.details["did_you_mean"]
+    assert "TextRange" in excinfo.value.details["hint"]
+
+
+def test_unknown_member_set_suggests_candidates() -> None:
+    target = make_textframe_target()
+    with pytest.raises(BridgeError) as excinfo:
+        run("set", "Selection.TextFrame.Text", target, value="x", dry_run=True)
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    assert "TextRange" in excinfo.value.details["did_you_mean"]
+
+
+def test_get_notes_callable_member() -> None:
+    textframe = Node("textframe", {"Text": Node("Text-param")})
+    target = make_textframe_target(textframe=textframe)
+    result = run("get", "Selection.TextFrame.Text", target)
+    assert "note" in result
+    assert "call" in result["note"]
+
+
+def test_set_dry_run_previews_parameterized_property() -> None:
+    setter = Node("Text")
+    textframe = ParamNode("textframe", {"Text": setter})
+    target = make_textframe_target(textframe=textframe)
+    result = run("set", "Selection.TextFrame.Text", target, value="hello", dry_run=True)
+    assert result["applied"] is False
+    assert result["applied_via"] == "parameterized_property"
+    assert setter.calls == []
+
+
+def test_set_falls_back_to_parameterized_property() -> None:
+    setter = Node("Text")
+    textframe = ParamNode("textframe", {"Text": setter})
+    target = make_textframe_target(textframe=textframe)
+    result = run("set", "Selection.TextFrame.Text", target, value="hello", confirm=True)
+    assert result["applied"] is True
+    assert result["applied_via"] == "parameterized_property"
+    assert setter.calls == [("hello",)]
+
+
+def test_set_reports_unsaved_changes() -> None:
+    document = Node("document", {"Saved": False, "ReadOnly": True})
+    target = make_target(document=document)
+    result = run("set", "ReadOnly", target, root="document", value=False, confirm=True)
+    assert result["unsaved_changes"] is True
+
+
+def test_call_reports_saved_state() -> None:
+    document = Node("document", {"Saved": True, "Reorder": Node("Reorder")})
+    target = make_target(document=document)
+    result = run("call", "Reorder()", target, root="document", confirm=True)
+    assert result["unsaved_changes"] is False
+
+
+def test_call_unsaved_state_unknown_when_unreadable() -> None:
+    document = Node("document", {"Reorder": Node("Reorder")})
+    target = make_target(document=document)
+    result = run("call", "Reorder()", target, root="document", confirm=True)
+    assert result["unsaved_changes"] is None

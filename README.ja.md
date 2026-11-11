@@ -72,6 +72,10 @@ office excel range add-hyperlink E35 --url "https://example.com/" --yes
 office word selection read
 office word selection insert-text "Replacement" --yes
 office powerpoint slide inspect
+office powerpoint slides read --start 1 --count 20
+office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
+office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "補足" --yes
+office powerpoint slide add --index 70 --yes
 office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
@@ -120,6 +124,9 @@ office com set 'window.Selection.Font.Bold' --value true --dry-run
 - `excel.range.set_format` — 書式を明示的に設定する:フォント名(和文フォント対応)、フォントサイズ、太字、斜体、下線、文字色、数値フォーマット、水平・垂直配置、自動折返し、塗りつぶし色、連続罫線と罫線色
 - `excel.range.add_hyperlink` — 範囲に本物のハイパーリンクオブジェクトを追加する(青字下線に似せただけの文字はクリックできない)。リンクは範囲全体に掛かり、表示テキストは左上セルの値を使う。範囲にすでにハイパーリンクがあればアドレスだけ更新するので、同じ操作を繰り返しても結果は同じになる。`sub_address`(アンカーまたはシート参照)と`screen_tip`(ツールチップ)は省略可能なオプション。数式風の`=`始まりの文字列は差し戻す
 - `word.selection.insert_text`
+- `powerpoint.text.replace` — 指定図形の中身を検索語に置換する(`TextRange.Replace`を使い書式とレイアウトを保持)。dry-runは該当数を返し、実行後は読み戻して`verified`を付ける
+- `powerpoint.textbox.add` — 指定スライドにテキストボックスを追加する(位置・サイズはすべてポイント)。dry-runはスライド内に収まるかを判定し、実行後は生成図形の`index`・`id`・`name`を返す
+- `powerpoint.slide.add` — 指定位置(既定は末尾)にスライドを追加する(レイアウト番号は既定2=タイトルとコンテンツ)。実行後は新スライドのindexとプレースホルダーを返す
 - `excel.active_sheet` — `/set-property`経由で変更
 
 書き込み操作は`dry_run`に対応し、dry_run以外は`confirm`を要求します。プロパティ変更にも`confirm`が必要です。
@@ -135,6 +142,8 @@ office com set 'window.Selection.Font.Bold' --value true --dry-run
 ```
 
 `get`はプロパティの読み取り、`call`はメソッドの実行、`set`は`value`をプロパティへ代入します。`root`を明示しない限り、式の先頭セグメントがルートを兼ねます。`call`と`set`は`dry_run`に対応し、dry_run以外は`confirm`を要求します。
+
+存在しないメンバー名は`INVALID_REQUEST`で差し戻し、`details.did_you_mean`に対象オブジェクトの実メンバー名の候補、`details.hint`に定番の代替経路(例: `TextFrame.Text`なら`TextRange.Text`)を載せます。`com set`の`--value`は`@path`でUTF-8ファイルから値を読み込めるため、日本語の長文・複数行テキストをシェルの引用符やコードページに左右されず渡せます。式内の文字列リテラルは`\n`、`\t`、`\r`、`\v`(縦タブ)、`\/`、`\uXXXX`のエスケープに対応します。実行した`call`と`set`の結果には`unsaved_changes`(未保存の変更があるか)が付きます。
 
 あえて通さないのは保存と終了の2種類だけです。名前の先頭が`save`または`close`のメンバー(`quit`と`exit`も)は、メソッド呼び出しとプロパティ設定で`OPERATION_BLOCKED`として差し戻します。プロパティの読み取り(`document.Saved`など)はいくらでもできます。拒否リストへの追加は`OFFICE_BRIDGE_BLOCKED_CALLS`(カンマ区切り)で。
 

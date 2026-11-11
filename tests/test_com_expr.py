@@ -40,6 +40,32 @@ def test_parse_escapes() -> None:
     assert segments[0].args == ("a\nb\\c'd",)
 
 
+def test_parse_vertical_tab_and_slash_escapes() -> None:
+    segments = parse_expression(r'TypeText("a\vb\/c")')
+    assert segments[0].args == ("a\vb/c",)
+
+
+def test_parse_unicode_escape() -> None:
+    segments = parse_expression(r'TypeText("\u65e5\u672c\u8a9e")')
+    assert segments[0].args == ("日本語",)
+
+
+def test_parse_value_unicode_escape() -> None:
+    assert parse_value(r'"a\u00e9b"') == "aéb"
+
+
+def test_parse_rejects_bad_unicode_escape() -> None:
+    with pytest.raises(BridgeError) as excinfo:
+        parse_expression(r'TypeText("\u65e")')
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_parse_rejects_unknown_escape() -> None:
+    with pytest.raises(BridgeError) as excinfo:
+        parse_expression(r'TypeText("a\qb")')
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
 def test_parse_rejects_empty() -> None:
     with pytest.raises(BridgeError) as excinfo:
         parse_expression("   ")

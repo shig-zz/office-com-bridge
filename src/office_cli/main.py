@@ -27,6 +27,13 @@ word_selection_app = typer.Typer(help="Word selection commands.", no_args_is_hel
 word_document_app = typer.Typer(help="Word document commands.", no_args_is_help=True)
 powerpoint_app = typer.Typer(help="PowerPoint commands.", no_args_is_help=True)
 powerpoint_slide_app = typer.Typer(help="PowerPoint slide commands.", no_args_is_help=True)
+powerpoint_slides_app = typer.Typer(
+    help="PowerPoint presentation-wide slide commands.", no_args_is_help=True
+)
+powerpoint_text_app = typer.Typer(help="PowerPoint text commands.", no_args_is_help=True)
+powerpoint_textbox_app = typer.Typer(
+    help="PowerPoint text box commands.", no_args_is_help=True
+)
 powerpoint_document_app = typer.Typer(
     help="PowerPoint presentation commands.", no_args_is_help=True
 )
@@ -45,6 +52,9 @@ word_app.add_typer(word_selection_app, name="selection")
 word_app.add_typer(word_document_app, name="document")
 app.add_typer(powerpoint_app, name="powerpoint")
 powerpoint_app.add_typer(powerpoint_slide_app, name="slide")
+powerpoint_app.add_typer(powerpoint_slides_app, name="slides")
+powerpoint_app.add_typer(powerpoint_text_app, name="text")
+powerpoint_app.add_typer(powerpoint_textbox_app, name="textbox")
 powerpoint_app.add_typer(powerpoint_document_app, name="document")
 app.add_typer(com_app, name="com")
 app.add_typer(target_app, name="target")
@@ -246,6 +256,40 @@ def _parse_json_or_string(value: str) -> Any:
         return value
 
 
+def _resolve_value_argument(value: str) -> Any:
+    """Parse a --value argument, reading it from a UTF-8 file when prefixed with '@'.
+
+    Long or multi-line text (Japanese text, PowerPoint paragraphs) is unsafe to pass
+    through a shell command line, so '@path' loads the value from a file instead.
+    """
+    if not value.startswith("@"):
+        return _parse_json_or_string(value)
+    path = Path(value[1:])
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not read {path}: {exc}") from exc
+    return _parse_json_or_string(raw)
+
+
+def _shape_argument(value: str) -> Any:
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    return value
+
+
+def _resolve_text_argument(value: str) -> str:
+    """Keep PowerPoint text as text; '@path' loads it from a UTF-8 file."""
+    if not value.startswith("@"):
+        return value
+    path = Path(value[1:])
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not read {path}: {exc}") from exc
+
+
 def _load_values(json_text: str | None, json_file: Path | None) -> Any:
     if bool(json_text) == bool(json_file):
         raise typer.BadParameter("Provide exactly one of --json or --file.")
@@ -400,7 +444,7 @@ def inspect(
     ctx: typer.Context,
     kind: str = typer.Argument(
         ...,
-        help="Inspection kind: selection, document, excel.range, excel.workbook, word.selection, word.document, powerpoint.slide, powerpoint.document.",
+        help="Inspection kind: selection, document, excel.range, excel.workbook, word.selection, word.document, powerpoint.slide, powerpoint.slides, powerpoint.document.",
     ),
     param: list[str] = typer.Option(
         [],
@@ -816,11 +860,204 @@ def powerpoint_document_read(ctx: typer.Context) -> None:
     _run(ctx, lambda client: client.inspect("powerpoint.document", {}))
 
 
+@powerpoint_slides_app.command("read")
+def powerpoint_slides_read(
+    ctx: typer.Context,
+    start: int = typer.Option(
+        1, "--start", help="1-based first slide to read."
+    ),
+    count: int = typer.Option(
+        20, "--count", help="Number of slides to read (max 100)."
+    ),
+) -> None:
+    """Read a window of slides with notes and shape geometry in points."""
+    _run(ctx, lambda client: client.inspect("powerpoint.slides", {"start": start, "count": count}))
+
+
+@powerpoint_text_app.command("replace")
+def powerpoint_text_replace(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    find: str = typer.Option(..., "--find", help="Text to find in the shape."),
+    replace: str = typer.Option(
+        ...,
+        "--replace",
+        help="Replacement text, or '@path' to read it from a UTF-8 file.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report how many times the text occurs without changing it.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Replace text inside one shape in place, keeping formatting."""
+    params: dict[str, Any] = {
+        "slide": slide,
+        "shape": _shape_argument(shape),
+        "find": find,
+        "replace": _resolve_text_argument(replace),
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"replace {find!r} with {params['replace']!r} on slide {slide}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.text.replace", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_textbox_app.command("add")
+def powerpoint_textbox_add(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    left: float = typer.Option(..., "--left", help="Left position in points."),
+    top: float = typer.Option(..., "--top", help="Top position in points."),
+    width: float = typer.Option(..., "--width", help="Width in points."),
+    height: float = typer.Option(..., "--height", help="Height in points."),
+    text: str = typer.Option(
+        ...,
+        "--text",
+        help="Text to write, or '@path' to read it from a UTF-8 file.",
+    ),
+    font_size: float = typer.Option(
+        None, "--font-size", help="Optional font size in points."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Validate the position without adding the text box.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Add a text box to a slide. Geometry is in points."""
+    params: dict[str, Any] = {
+        "slide": slide,
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "text": _resolve_text_argument(text),
+        "dry_run": dry_run,
+    }
+    if font_size is not None:
+        params["font_size"] = font_size
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"add a text box on slide {slide} at ({left}, {top}) "
+                    f"{width}x{height} pt with {len(params['text'])} characters",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.textbox.add", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_slide_app.command("add")
+def powerpoint_slide_add(
+    ctx: typer.Context,
+    index: int = typer.Option(
+        None,
+        "--index",
+        help="1-based position for the new slide; omit to append at the end.",
+    ),
+    layout: int = typer.Option(
+        None,
+        "--layout",
+        help="Layout number (default 2, Title and Content).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate without adding the slide."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Add a slide to the presentation without saving."""
+    params: dict[str, Any] = {"dry_run": dry_run}
+    if index is not None:
+        params["index"] = index
+    if layout is not None:
+        params["layout"] = layout
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            position = f"position {index}" if index is not None else "the end"
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"add a slide at {position}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.slide.add", params)
+
+    _run(ctx, action)
+
+
 @app.command("set-property")
 def set_property(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Allowed property name, for example excel.active_sheet."),
-    value: str = typer.Option(..., "--value", help="JSON value or plain string."),
+    value: str = typer.Option(
+        ...,
+        "--value",
+        help="JSON value or plain string, or '@path' to read the value from a UTF-8 file.",
+    ),
     yes: bool = typer.Option(
         False, "--yes", help="Skip the interactive confirmation prompt."
     ),
@@ -831,7 +1068,7 @@ def set_property(
     ),
 ) -> None:
     """Change an allowed document property."""
-    parsed_value = _parse_json_or_string(value)
+    parsed_value = _resolve_value_argument(value)
 
     def action(client: BridgeClient) -> dict[str, Any]:
         if not yes:
@@ -938,7 +1175,7 @@ def com_set(
     ),
 ) -> None:
     """Set any property on the Office object model."""
-    parsed_value = _parse_json_or_string(value)
+    parsed_value = _resolve_value_argument(value)
     if parsed_value is None:
         raise typer.BadParameter(
             "Setting a property to null is not supported; pass an empty string instead."
