@@ -110,6 +110,21 @@ def test_structural_operations_require_excel() -> None:
             make_target(AppKind.WORD), "powerpoint.shape.set_format", {"slide": 1, "shape": 1, "font_size": 12}, _settings
         )
     assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+
+
+def test_structural_operation_names_are_parsed() -> None:
+    # The dimension and mode come from the operation name; a missing spec
+    # parameter must surface as INVALID_REQUEST, not crash on name parsing.
+    for operation, key in (
+        ("excel.rows.insert", "row"),
+        ("excel.rows.delete", "row"),
+        ("excel.columns.insert", "column"),
+        ("excel.columns.delete", "column"),
+    ):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(make_target(AppKind.EXCEL), operation, {}, _settings)
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+        assert excinfo.value.message == f"Parameter {key!r} is required."
     with pytest.raises(BridgeError) as excinfo:
         registry.inspect(
             make_target(AppKind.WORD), "excel.range.format", {"address": "A1"}, _settings

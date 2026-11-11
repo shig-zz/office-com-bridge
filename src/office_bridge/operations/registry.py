@@ -230,7 +230,7 @@ def _invoke(
         "excel.columns.delete",
     }:
         _require_app(target, AppKind.EXCEL, operation)
-        dimension, _, mode = operation.split(".")[1:]
+        dimension, mode = operation.split(".")[1:]
         spec_key = "row" if dimension == "rows" else "column"
         if spec_key not in params:
             raise invalid_request(f"Parameter {spec_key!r} is required.")
