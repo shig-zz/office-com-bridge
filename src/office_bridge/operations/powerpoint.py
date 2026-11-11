@@ -12,6 +12,11 @@ from .common import (
     truncate_text,
 )
 
+_UNDO_HINT = (
+    "roll this back with the 'undo' operation only after the user approves; "
+    "it reverts the most recent Office action"
+)
+
 
 def _slide_error(message: str, exc: BaseException) -> BridgeError:
     hresult = getattr(exc, "hresult", None)
@@ -733,6 +738,315 @@ def slide_delete(
             "deleted": True,
             "verified": after == total - 1,
             "slide_count_after": after,
+            "undo_hint": _UNDO_HINT,
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Write: move a slide
+# ---------------------------------------------------------------------------
+
+
+def slide_move(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    to_index: Any,
+    dry_run: bool,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Move a slide with Slides(n).MoveTo and verify through the SlideID."""
+    presentation = target.document
+    check_expected_document(target, params)
+    slide = _slide_at(presentation, slide_index)
+    if isinstance(to_index, bool) or not isinstance(to_index, int) or to_index < 1:
+        raise invalid_request("Parameter 'to' must be a 1-based slide number.")
+    if to_index == slide_index:
+        raise invalid_request(
+            "Parameter 'to' must differ from 'slide'.",
+            {"slide": slide_index, "to": to_index},
+        )
+    total = _slide_count(presentation)
+    if to_index > total:
+        raise invalid_request(
+            "Parameter 'to' is beyond the last slide.",
+            {"to": to_index, "slide_count": total},
+        )
+    try:
+        slide_id = int(slide.SlideID)
+    except Exception:
+        slide_id = None
+    result: dict[str, Any] = {
+        "application": "PowerPoint",
+        "dry_run": dry_run,
+        "moved": False,
+        "slide": slide_index,
+        "to": to_index,
+        "direction": "up" if to_index < slide_index else "down",
+        "slide_title": _slide_title(slide),
+        "slide_count": total,
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "powerpoint.slide.move")
+
+    try:
+        slide.MoveTo(to_index)
+    except Exception as exc:
+        raise _slide_error("The slide could not be moved.", exc) from exc
+    try:
+        landed = presentation.Slides(to_index)
+        landed_index = int(landed.SlideIndex)
+        landed_id = int(landed.SlideID)
+    except Exception as exc:
+        raise _slide_error(
+            "The slide move call ran but the moved slide could not be read back.", exc
+        ) from exc
+    result.update(
+        {
+            "moved": True,
+            "slide_title_after": _slide_title(landed),
+            "verified": landed_index == to_index
+            and (slide_id is None or landed_id == slide_id),
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Write: delete a shape
+# ---------------------------------------------------------------------------
+
+
+def shape_delete(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    shape_ref: Any,
+    dry_run: bool,
+    max_text_chars: int,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    presentation = target.document
+    check_expected_document(target, params)
+    slide = _slide_at(presentation, slide_index)
+    shape = _shape_at(slide, shape_ref)
+    try:
+        count_before = int(slide.Shapes.Count)
+    except Exception as exc:
+        raise _slide_error("The shapes on this slide could not be counted.", exc) from exc
+    try:
+        name = str(shape.Name)
+    except Exception:
+        name = ""
+    try:
+        shape_type: int | None = int(shape.Type)
+    except Exception:
+        shape_type = None
+    text_preview = truncate_text(_shape_texts(shape), max_text_chars)[0]
+
+    result: dict[str, Any] = {
+        "application": "PowerPoint",
+        "dry_run": dry_run,
+        "deleted": False,
+        "slide": slide_index,
+        "shape": shape_ref,
+        "shape_name": name,
+        "shape_type": shape_type,
+        "shape_count_before": count_before,
+        "text_preview": text_preview,
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "powerpoint.shape.delete")
+
+    try:
+        shape.Delete()
+    except Exception as exc:
+        raise _slide_error("The shape could not be deleted.", exc) from exc
+    try:
+        count_after: int | None = int(slide.Shapes.Count)
+    except Exception:
+        count_after = None
+    result.update(
+        {
+            "deleted": True,
+            "shape_count_after": count_after,
+            "verified": count_after is not None and count_after == count_before - 1,
+            "undo_hint": _UNDO_HINT,
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Write: set text font formatting on one shape
+# ---------------------------------------------------------------------------
+
+_MSO_TRUE = -1
+_MSO_FALSE = 0
+
+
+def _parse_color(value: Any, key: str) -> tuple[int, str]:
+    """Parse RRGGBB text into the BGR integer Office stores; return both."""
+    if not isinstance(value, str):
+        raise invalid_request(
+            f"Parameter {key!r} must be a 'RRGGBB' or '#RRGGBB' hex color string.",
+            {"parameter": key},
+        )
+    text = value.strip().lstrip("#")
+    if len(text) != 6:
+        raise invalid_request(
+            f"Parameter {key!r} must be a 'RRGGBB' or '#RRGGBB' hex color string.",
+            {"parameter": key},
+        )
+    try:
+        rgb = int(text, 16)
+    except ValueError:
+        raise invalid_request(
+            f"Parameter {key!r} is not a valid hex color: {value!r}.",
+            {"parameter": key},
+        ) from None
+    red = (rgb >> 16) & 0xFF
+    green = (rgb >> 8) & 0xFF
+    blue = rgb & 0xFF
+    # Office stores colors as BGR.
+    return blue * 0x10000 + green * 0x100 + red, f"{text.upper()}"
+
+
+def _color_hex(value: Any) -> str | None:
+    try:
+        raw = int(value) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return None
+    return f"{raw & 0xFF:02X}{(raw >> 8) & 0xFF:02X}{(raw >> 16) & 0xFF:02X}"
+
+
+def _read_font(font: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {}
+    try:
+        entry["name"] = str(font.Name)
+    except Exception:
+        entry["name"] = None
+    try:
+        entry["size"] = float(font.Size)
+    except Exception:
+        entry["size"] = None
+    try:
+        bold = int(font.Bold)
+    except Exception:
+        entry["bold"] = None
+    else:
+        entry["bold"] = True if bold == _MSO_TRUE else False if bold == _MSO_FALSE else "mixed"
+    try:
+        entry["color"] = _color_hex(font.Color.RGB)
+    except Exception:
+        entry["color"] = None
+    return entry
+
+
+def shape_set_format(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    shape_ref: Any,
+    font_size: Any,
+    font_name: Any,
+    color: Any,
+    bold: Any,
+    dry_run: bool,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Write the allowed TextRange.Font properties on one shape.
+
+    Only the text of the shape is touched: the shape outline and fill
+    (Line/Fill) are deliberately left alone. Colors are written as the BGR
+    integer Office uses, taken from an RRGGBB string like the Excel
+    set_format command, and read back through _color_hex for verification.
+    """
+    requested: dict[str, Any] = {}
+    if font_size is not None:
+        if isinstance(font_size, bool) or not isinstance(font_size, (int, float)) or not 1 <= float(font_size) <= 400:
+            raise invalid_request("Parameter 'font_size' must be a point size between 1 and 400.")
+        requested["font_size"] = float(font_size)
+    if font_name is not None:
+        if not isinstance(font_name, str) or not font_name.strip():
+            raise invalid_request("Parameter 'font_name' must be a font name.")
+        requested["font_name"] = font_name.strip()
+    if color is not None:
+        requested["color"] = _parse_color(color, "color")
+    if bold is not None:
+        if not isinstance(bold, bool):
+            raise invalid_request("Parameter 'bold' must be true or false.")
+        requested["bold"] = bold
+    if not requested:
+        raise invalid_request(
+            "At least one of 'font_size', 'font_name', 'color' or 'bold' is required."
+        )
+    check_expected_document(target, params)
+
+    slide = _slide_at(target.document, slide_index)
+    shape = _shape_at(slide, shape_ref)
+    text_range = _text_range(shape, slide_index, shape_ref)
+    try:
+        font_before = _read_font(text_range.Font)
+    except Exception as exc:
+        raise _slide_error("The shape's current font could not be read.", exc) from exc
+
+    planned: dict[str, Any] = {}
+    if "font_size" in requested:
+        planned["font_size"] = requested["font_size"]
+    if "font_name" in requested:
+        planned["font_name"] = requested["font_name"]
+    if "color" in requested:
+        planned["color"] = requested["color"][1]
+    if "bold" in requested:
+        planned["bold"] = requested["bold"]
+
+    result: dict[str, Any] = {
+        "application": "PowerPoint",
+        "dry_run": dry_run,
+        "changed": False,
+        "apply_to": "text_range",
+        "slide": slide_index,
+        "shape": shape_ref,
+        "font_before": font_before,
+        "planned": planned,
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "powerpoint.shape.set_format")
+
+    try:
+        font = text_range.Font
+        if "font_name" in requested:
+            font.Name = requested["font_name"]
+        if "font_size" in requested:
+            font.Size = requested["font_size"]
+        if "bold" in requested:
+            font.Bold = _MSO_TRUE if requested["bold"] else _MSO_FALSE
+        if "color" in requested:
+            font.Color.RGB = requested["color"][0]
+        font_after = _read_font(text_range.Font)
+    except Exception as exc:
+        raise _slide_error("The shape formatting could not be changed.", exc) from exc
+
+    checks: list[bool] = []
+    if "font_name" in requested:
+        checks.append(font_after.get("name") == requested["font_name"])
+    if "font_size" in requested:
+        checks.append(font_after.get("size") == requested["font_size"])
+    if "bold" in requested:
+        checks.append(font_after.get("bold") is requested["bold"])
+    if "color" in requested:
+        checks.append(font_after.get("color") == requested["color"][1])
+    result.update(
+        {
+            "changed": True,
+            "font_after": font_after,
+            "verified": all(checks),
         }
     )
     return result

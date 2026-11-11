@@ -56,10 +56,65 @@ def test_operations_listed_in_capabilities() -> None:
     assert "powerpoint.notes.set" in names
     assert "powerpoint.slide.delete" in names
     assert "undo" in names
+    assert "excel.rows.insert" in names
+    assert "excel.rows.delete" in names
+    assert "excel.columns.insert" in names
+    assert "excel.columns.delete" in names
+    assert "excel.rows.move" in names
+    assert "word.replace" in names
+    assert "word.paragraph.replace_text" in names
+    assert "powerpoint.slide.move" in names
+    assert "powerpoint.shape.delete" in names
+    assert "powerpoint.shape.set_format" in names
     inspections = [item["name"] for item in cap["inspections"]]
     assert "powerpoint.slides" in inspections
     assert "powerpoint.notes" in inspections
+    assert "excel.range.format" in inspections
+    assert "word.find" in inspections
+    assert "word.paragraphs" in inspections
     assert cap["com"]["batch_endpoint"] == "POST /com/batch"
+
+
+def test_word_editing_operations_require_word() -> None:
+    for operation, params in (
+        ("word.replace", {"find": "a", "replace": "b"}),
+        ("word.paragraph.replace_text", {"paragraph": 1, "text": "x"}),
+    ):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(make_target(AppKind.EXCEL), operation, params, _settings)
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+    for kind, params in (
+        ("word.find", {"find": "a"}),
+        ("word.paragraphs", {}),
+    ):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.inspect(make_target(AppKind.EXCEL), kind, params, _settings)
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+
+
+def test_structural_operations_require_excel() -> None:
+    for operation in ("excel.rows.insert", "excel.rows.move", "excel.columns.delete"):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(
+                make_target(AppKind.WORD), operation, {"row": 2, "to": 3}, _settings
+            )
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+    for operation in ("powerpoint.slide.move", "powerpoint.shape.delete"):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(
+                make_target(AppKind.EXCEL), operation, {"slide": 1, "to": 2}, _settings
+            )
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+    with pytest.raises(BridgeError) as excinfo:
+        registry.invoke(
+            make_target(AppKind.WORD), "powerpoint.shape.set_format", {"slide": 1, "shape": 1, "font_size": 12}, _settings
+        )
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+    with pytest.raises(BridgeError) as excinfo:
+        registry.inspect(
+            make_target(AppKind.WORD), "excel.range.format", {"address": "A1"}, _settings
+        )
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
 
 
 def test_write_results_report_unsaved_changes() -> None:

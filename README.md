@@ -93,15 +93,30 @@ office --target t-1a2b3c4d5e6f excel range read A1:B2 --formulas
 office --target t-1a2b3c4d5e6f excel range write A1:B2 --json "[[1,2],[3,4]]" --dry-run
 office --target t-1a2b3c4d5e6f excel range write A1:B2 --json "[[1,2],[3,4]]" --yes
 office excel range copy-format A1:B2 C1:D2 --yes
+office excel range copy-format A1:B2 C1:D2 --borders --yes
 office excel range set-format A1:B2 --font-name "MS Gothic" --font-size 11 --halign center --yes
+office excel range read-format A1:B2 --borders
 office excel range add-hyperlink E35 --url "https://example.com/" --yes
+office excel rows insert "2:4" --yes
+office excel rows delete 61 --yes
+office excel rows move 61 --to 60 --yes
+office excel columns insert C --yes
+office excel columns delete "A:C" --yes
 office word selection read
 office word selection insert-text "Replacement" --yes
+office word paragraphs read --start 1 --count 50
+office word find "term" --match-case
+office word replace "old" --replace-with "new" --dry-run
+office word replace "old" --replace-with "new" --yes
+office word paragraph replace 12 --text "New body" --yes
 office powerpoint slide inspect
 office powerpoint slides read --start 1 --count 20
 office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
 office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "Note" --yes
 office powerpoint slide add --index 70 --yes
+office powerpoint slide move 72 --to 3 --yes
+office powerpoint shape delete 5 --shape 2 --dry-run
+office powerpoint shape set-format 5 --shape "TextBox 3" --font-size 14 --color FF8000 --yes
 office powerpoint notes read 70
 office powerpoint notes set 70 --text "Speaker note" --yes
 office powerpoint slide delete 71 --dry-run
@@ -173,7 +188,9 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
 - `excel.range.write` with literal values (formulas are rejected)
 - `excel.range.copy_format` copies formatting only (font, fill, borders,
   number format, alignment) from a source range to a same-sized target range;
-  values are never changed
+  values are never changed. This build does not propagate cell borders through
+  the paste, so `borders: true` re-applies them cell by cell (reported as
+  `borders_applied`)
 - `excel.range.set_format` sets explicit formatting: font name (including
   far-east), font size, bold, italic, underline, font color, number format,
   horizontal/vertical alignment, wrap, fill color, continuous border and
@@ -185,6 +202,13 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   Optional `sub_address` (anchor or sheet reference) and `screen_tip` (tooltip)
   are supported; formula-style strings beginning with `=` are rejected
 - `word.selection.insert_text`
+- `word.replace` replaces occurrences of a literal string through Word's own
+  Find (formatting preserved; tracked when Track Changes is on). Dry-run reports
+  the match count and first paragraph; the run re-scans and reports `verified`.
+  `nth` replaces only that numbered match
+- `word.paragraph.replace_text` replaces one paragraph's body text by 1-based
+  number, keeping the paragraph break; dry-run reports the paragraph count
+  before/after (newlines split paragraphs)
 - `powerpoint.text.replace` replaces text inside one shape's text frame with
   `TextRange.Replace`, keeping run formatting and layout. Dry-run reports the
   occurrence count; the run reads the shape back and returns `verified`
@@ -198,6 +222,16 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   the current notes, the run reads them back and returns `verified`
 - `powerpoint.slide.delete` deletes one slide by 1-based number; dry-run reports
   the slide's title, the run verifies the slide count dropped by one
+- `powerpoint.slide.move` moves one slide to a new 1-based position
+  (`Slides(n).MoveTo`); dry-run reports the title and direction, the run
+  verifies the same SlideID at the destination index
+- `powerpoint.shape.delete` deletes one shape by index or name; dry-run reports
+  the shape name, type and a text preview, the run verifies the shape count
+  dropped by one and returns an undo hint
+- `powerpoint.shape.set_format` sets the text font of one shape (`font_size`,
+  `font_name`, RRGGBB `color`, `bold`) through `TextFrame.TextRange.Font` only;
+  dry-run returns the current values and the planned change, the run reads the
+  font back and reports `verified`
 - `undo` undoes the most recent Office action in the attached application
   (`application.Undo`); dry-run reports whether anything is undoable
   (`application.Undoable`)
@@ -206,6 +240,12 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
 Write operations support `dry_run` and, except for dry runs, require `confirm`.
 Property changes also require `confirm`. Executed writes report
 `unsaved_changes` so the agent can ask the user to save in Office.
+
+Curated reads include `excel.range.format` (cell-by-cell fill/font/border reads
+with RRGGBB colors), `word.paragraphs` (paragraph window with style names and
+heading flags) and `word.find` (literal search with paragraph numbers and
+context; read-only, no confirmation). Destructive writes (`slide delete`,
+`shape delete`, `rows/columns delete`) return an `undo_hint`.
 
 ## General operations
 

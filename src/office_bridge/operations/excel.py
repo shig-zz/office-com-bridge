@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 import pywintypes
@@ -28,6 +29,20 @@ _XL_HALIGN = {"left": -4131, "center": -4108, "right": -4152}
 _XL_VALIGN = {"top": -4160, "middle": -4108, "bottom": -4107}
 _XL_LINE_CONTINUOUS = 1
 _XL_PATTERN_SOLID = 1
+_XL_PATTERN_NONE = -4142
+_XL_INSERT_SHIFT = {"down": -4107, "right": -4161}
+_XL_DELETE_SHIFT = {"up": -4122, "left": -4121}
+_XL_BORDER_SIDES = {"left": 7, "top": 8, "bottom": 9, "right": 10}
+_XL_LINE_STYLES = {
+    -4142: "none",
+    1: "continuous",
+    3: "dotted",
+    4: "dashed",
+    5: "dash dot",
+    6: "dash dot dot",
+    7: "double",
+    13: "slant dash dot",
+}
 
 
 def _dims(range_object: Any) -> tuple[int, int]:
@@ -334,6 +349,7 @@ def copy_format(
     dry_run: bool,
     max_cells: int,
     params: dict[str, Any],
+    include_borders: bool = False,
 ) -> dict[str, Any]:
     check_expected_document(target, params)
     source = _range(target, source_address)
@@ -385,6 +401,31 @@ def copy_format(
     except Exception:
         pass
     result["copied"] = True
+    result["borders_applied"] = False
+    if include_borders:
+        # This build does not propagate cell borders through a format paste,
+        # so re-apply them cell by cell from the source.
+        try:
+            for row in range(1, rows + 1):
+                for column in range(1, columns + 1):
+                    source_border_owner = source.Cells(row, column)
+                    dest_border_owner = dest.Cells(row, column)
+                    for position in _XL_BORDER_SIDES.values():
+                        source_border = source_border_owner.Borders(position)
+                        style = int(source_border.LineStyle)
+                        dest_border = dest_border_owner.Borders(position)
+                        dest_border.LineStyle = style
+                        if style != _XL_PATTERN_NONE:
+                            dest_border.Weight = int(source_border.Weight)
+                            dest_border.Color = int(source_border.Color)
+            result["borders_applied"] = True
+        except pywintypes.com_error as exc:
+            raise _range_error(exc) from exc
+    else:
+        result["borders_note"] = (
+            "this build does not propagate cell borders through a format paste; "
+            "run again with borders: true to copy them per cell"
+        )
     return result
 
 
@@ -838,3 +879,450 @@ def set_active_sheet(target: ResolvedTarget, value: Any, params: dict[str, Any])
         raise _range_error(exc) from exc
     target.refresh_info()
     return {"active_sheet": value}
+
+
+# ---------------------------------------------------------------------------
+# Structural writes: insert/delete whole rows or columns, move a row
+#
+# Whole-row and whole-column insert/delete work through COM on this build
+# (unlike Range.Sort), but the shift enums must be exact and every range
+# reference must be re-resolved afterwards. These operations wrap both and
+# verify through the sheet's used range.
+# ---------------------------------------------------------------------------
+
+_ROW_SPEC = re.compile(r"^\d+(?::\d+)?$")
+_COLUMN_SPEC = re.compile(r"^\d+(?::\d+)?$|^[A-Za-z]{1,3}(?::[A-Za-z]{1,3})?$")
+_DIGIT_RANGE = re.compile(r"^\d+:\d+$")
+_UNDO_HINT = (
+    "roll this back with the 'undo' operation only after the user approves; "
+    "it reverts the most recent Office action"
+)
+
+
+def _sheet_name(sheet: Any) -> str:
+    try:
+        return str(sheet.Name)
+    except Exception:
+        return ""
+
+
+def _last_used_index(sheet: Any, dimension: str) -> int | None:
+    """Last row (or column) inside the sheet's used range, None if unreadable."""
+    try:
+        used = sheet.UsedRange
+        if dimension == "rows":
+            first = int(used.Row)
+            count = int(used.Rows.Count)
+        else:
+            first = int(used.Column)
+            count = int(used.Columns.Count)
+    except Exception:
+        return None
+    if count <= 0:
+        return None
+    return first + count - 1
+
+
+def _validate_block_spec(spec: Any, parameter: str, dimension: str) -> Any:
+    if isinstance(spec, bool) or not isinstance(spec, (int, str)):
+        raise invalid_request(
+            f"Parameter {parameter!r} must be a number or a range string.",
+            {"parameter": parameter},
+        )
+    text = str(spec).strip()
+    if not (_ROW_SPEC if dimension == "rows" else _COLUMN_SPEC).match(text):
+        example = '"61" or "2:4"' if dimension == "rows" else '"C", "3", or "A:C"'
+        raise invalid_request(
+            f"Parameter {parameter!r} must be a {dimension[:-1]} number or range "
+            f"such as {example}.",
+            {"parameter": parameter, parameter: spec},
+        )
+    if text.isdigit() or _DIGIT_RANGE.match(text):
+        parts = [int(part) for part in text.split(":")]
+        if any(part < 1 for part in parts) or (len(parts) == 2 and parts[1] < parts[0]):
+            raise invalid_request(
+                f"Parameter {parameter!r} must name at least one {dimension[:-1]} "
+                "with a positive number.",
+                {"parameter": parameter, parameter: spec},
+            )
+        return int(text) if ":" not in text else text
+    return text.upper()
+
+
+def insert_or_delete(
+    target: ResolvedTarget,
+    *,
+    dimension: str,
+    spec: Any,
+    shift: Any,
+    mode: str,
+    dry_run: bool,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Insert or delete whole rows/columns on the active sheet."""
+    check_expected_document(target, params)
+    if dimension not in ("rows", "columns") or mode not in ("insert", "delete"):
+        raise invalid_request(
+            "The dimension must be 'rows' or 'columns' and the mode 'insert' or 'delete'.",
+            {"dimension": dimension, "mode": mode},
+        )
+    parameter = "row" if dimension == "rows" else "column"
+    resolved = _validate_block_spec(spec, parameter, dimension)
+    shift_table = _XL_INSERT_SHIFT if mode == "insert" else _XL_DELETE_SHIFT
+    if shift is None:
+        shift_name = None
+    else:
+        if not isinstance(shift, str) or shift.lower() not in shift_table:
+            raise invalid_request(
+                f"Parameter 'shift' must be one of: {', '.join(shift_table)}.",
+                {"parameter": "shift"},
+            )
+        shift_name = shift.lower()
+    default_shift = (
+        "down"
+        if mode == "insert" and dimension == "rows"
+        else "right"
+        if mode == "insert"
+        else "up"
+        if dimension == "rows"
+        else "left"
+    )
+    try:
+        sheet = target.window.ActiveSheet
+        picker = sheet.Rows if dimension == "rows" else sheet.Columns
+        block = picker(resolved)
+        count = int(block.Rows.Count) if dimension == "rows" else int(block.Columns.Count)
+        first = int(block.Row) if dimension == "rows" else int(block.Column)
+    except BridgeError:
+        raise
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    except Exception as exc:
+        raise invalid_request(
+            f"Could not resolve {dimension} {spec!r} on the active sheet.",
+            {"parameter": parameter},
+        ) from exc
+    last_before = _last_used_index(sheet, dimension)
+    result: dict[str, Any] = {
+        "sheet": _sheet_name(sheet),
+        parameter: resolved,
+        "first": first,
+        "count": count,
+        "shift": shift_name or default_shift,
+        "last_used_before": last_before,
+        "dry_run": dry_run,
+        "applied": False,
+    }
+    if dry_run:
+        return result
+    require_confirm(params, f"excel.{dimension}.{mode}")
+    try:
+        if mode == "insert":
+            block.Insert(shift_table[shift_name or default_shift])
+        elif shift_name is None:
+            # Rows(n).Delete() with no shift argument is the reliable form on
+            # this build; a shift is only passed when the caller chose one.
+            block.Delete()
+        else:
+            block.Delete(shift_table[shift_name])
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    last_after = _last_used_index(sheet, dimension)
+    if last_before is None or last_after is None:
+        verified: bool | None = None
+    elif mode == "insert":
+        expected = last_before + (count if first <= last_before else 0)
+        verified = last_after == expected
+    else:
+        removed = 0 if first > last_before else min(count, last_before - first + 1)
+        verified = last_after == last_before - removed
+    result.update(
+        {
+            "applied": True,
+            "last_used_after": last_after,
+            "verified": verified,
+            "undo_hint": _UNDO_HINT,
+        }
+    )
+    return result
+
+
+def _positive_int(value: Any, parameter: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise invalid_request(
+            f"Parameter {parameter!r} must be a positive row number.",
+            {"parameter": parameter},
+        )
+    return value
+
+
+def _worksheet_by_name(target: ResolvedTarget, sheet_name: str | None) -> Any:
+    if sheet_name is None:
+        try:
+            return target.window.ActiveSheet
+        except pywintypes.com_error as exc:
+            raise _range_error(exc) from exc
+    workbook = target.document
+    try:
+        for index in range(1, int(workbook.Worksheets.Count) + 1):
+            candidate = workbook.Worksheets(index)
+            if str(candidate.Name).lower() == sheet_name.lower():
+                return candidate
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    raise invalid_request(f"Worksheet {sheet_name!r} was not found.", {"sheet": sheet_name})
+
+
+def _row_values(sheet: Any, row: int, last_col: int | None) -> list[Any]:
+    columns = last_col if last_col and last_col >= 1 else 1
+    address = f"A{row}:{_column_letter(columns)}{row}" if columns > 1 else f"A{row}"
+    try:
+        range_object = sheet.Range(address)
+        matrix = _rectangular(_matrix(range_object.Value2, 1, columns), 1, columns)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    return matrix[0]
+
+
+def move_rows(
+    target: ResolvedTarget,
+    *,
+    row: Any,
+    to: Any,
+    sheet_name: Any,
+    dry_run: bool,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Move one whole row with the choreography proven on this build.
+
+    Rows(src).Copy() puts the row on the clipboard; Rows(dst).Insert() pastes
+    the clipboard into the inserted row; clearing CutCopyMode drops it; and
+    deleting the duplicated original row completes the move. A failed move
+    leaves the sheet half-moved, so the completed steps are always reported:
+    re-read the sheet before cleaning up, and note that a single undo only
+    reverts the last step.
+    """
+    check_expected_document(target, params)
+    row_number = _positive_int(row, "row")
+    to_number = _positive_int(to, "to")
+    if row_number == to_number:
+        raise invalid_request(
+            "Parameter 'to' must differ from 'row'.", {"row": row_number, "to": to_number}
+        )
+    if sheet_name is not None and (not isinstance(sheet_name, str) or not sheet_name.strip()):
+        raise invalid_request("Parameter 'sheet' must be a sheet name.", {"parameter": "sheet"})
+    sheet = _worksheet_by_name(target, sheet_name)
+    last_row = _last_used_index(sheet, "rows")
+    last_col = _last_used_index(sheet, "columns")
+    if last_row is not None:
+        if row_number > last_row:
+            raise invalid_request(
+                f"Row {row_number} is below the last used row ({last_row}).",
+                {"row": row_number, "last_used_row": last_row},
+            )
+        if to_number > last_row + 1:
+            raise invalid_request(
+                f"Parameter 'to' is beyond the end of the used area ({last_row} + 1).",
+                {"to": to_number, "last_used_row": last_row},
+            )
+    direction = "up" if to_number < row_number else "down"
+    # Inserting above the source shifts it down (delete source + 1); inserting
+    # below leaves it in place (delete source). For a downward move the row is
+    # inserted one past the destination so it lands exactly at 'to' after the
+    # source delete shifts everything up by one.
+    insert_at = to_number if to_number < row_number else to_number + 1
+    delete_after_insert = row_number + 1 if to_number < row_number else row_number
+    if insert_at > 1048576:
+        raise invalid_request(
+            "The destination row is beyond the end of the worksheet.",
+            {"to": to_number},
+        )
+    result: dict[str, Any] = {
+        "sheet": _sheet_name(sheet),
+        "row": row_number,
+        "to": to_number,
+        "direction": direction,
+        "steps": ["copy", "insert", "clear_clipboard", "delete_original"],
+        "dry_run": dry_run,
+        "applied": False,
+        "completed_steps": [],
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "excel.rows.move")
+
+    completed: list[str] = []
+    original_sheet = None
+    try:
+        if sheet_name is not None:
+            active = target.window.ActiveSheet
+            if _sheet_name(active).lower() != _sheet_name(sheet).lower():
+                original_sheet = active
+                sheet.Activate()
+                completed.append("activate_sheet")
+        values = _row_values(sheet, row_number, last_col)
+        sheet.Rows(row_number).Copy()
+        completed.append("copy")
+        sheet.Rows(insert_at).Insert(_XL_INSERT_SHIFT["down"])
+        completed.append("insert")
+        target.application.CutCopyMode = False
+        completed.append("clear_clipboard")
+        sheet.Rows(delete_after_insert).Delete()
+        completed.append("delete_original")
+    except pywintypes.com_error as exc:
+        try:
+            target.application.CutCopyMode = False
+        except Exception:
+            pass
+        raise BridgeError(
+            ErrorCode.RANGE_INVALID,
+            "The row move stopped partway. Re-read the sheet before continuing: "
+            "it may be half-moved, and a single undo only reverts the last step.",
+            400,
+            {"error": str(exc), "completed_steps": completed},
+        ) from exc
+    finally:
+        if original_sheet is not None:
+            try:
+                original_sheet.Activate()
+            except Exception:
+                pass
+
+    moved_values = _row_values(sheet, to_number, last_col)
+    result.update(
+        {
+            "applied": True,
+            "completed_steps": completed,
+            "verified": moved_values == values,
+            "undo_note": (
+                "the move ran as separate Office actions; one undo reverts only "
+                "the last one"
+            ),
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Read: cell formatting
+#
+# Multi-cell reads are unreliable on this build (Interior.Color reports 0 for
+# mixed ranges) and colors are stored BGR, so every cell is read individually
+# and colors come back as RRGGBB hex.
+# ---------------------------------------------------------------------------
+
+
+def _color_hex(value: Any) -> str | None:
+    try:
+        raw = int(value) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return None
+    return f"{raw & 0xFF:02X}{(raw >> 8) & 0xFF:02X}{(raw >> 16) & 0xFF:02X}"
+
+
+def _cell_format(cell: Any, include_borders: bool) -> dict[str, Any]:
+    entry: dict[str, Any] = {}
+    try:
+        pattern = int(cell.Interior.Pattern)
+    except Exception:
+        pattern = _XL_PATTERN_NONE
+    if pattern == _XL_PATTERN_NONE:
+        entry["fill"] = None
+    else:
+        try:
+            entry["fill"] = _color_hex(cell.Interior.Color)
+        except Exception:
+            entry["fill"] = None
+    font: dict[str, Any] = {}
+    try:
+        font["name"] = str(cell.Font.Name)
+    except Exception:
+        font["name"] = None
+    try:
+        font["size"] = float(cell.Font.Size)
+    except Exception:
+        font["size"] = None
+    try:
+        font["bold"] = bool(cell.Font.Bold)
+    except Exception:
+        font["bold"] = None
+    try:
+        font["color"] = _color_hex(cell.Font.Color)
+    except Exception:
+        font["color"] = None
+    entry["font"] = font
+    try:
+        entry["number_format"] = str(cell.NumberFormat)
+    except Exception:
+        entry["number_format"] = None
+    try:
+        entry["halign"] = int(cell.HorizontalAlignment)
+    except Exception:
+        entry["halign"] = None
+    try:
+        entry["valign"] = int(cell.VerticalAlignment)
+    except Exception:
+        entry["valign"] = None
+    try:
+        entry["wrap"] = bool(cell.WrapText)
+    except Exception:
+        entry["wrap"] = None
+    if include_borders:
+        borders: dict[str, Any] = {}
+        for side, position in _XL_BORDER_SIDES.items():
+            try:
+                border = cell.Borders(position)
+                style = int(border.LineStyle)
+            except Exception:
+                borders[side] = None
+                continue
+            item: dict[str, Any] = {"style": _XL_LINE_STYLES.get(style, style)}
+            if style != _XL_PATTERN_NONE:
+                try:
+                    item["weight"] = int(border.Weight)
+                except Exception:
+                    item["weight"] = None
+                try:
+                    item["color"] = _color_hex(border.Color)
+                except Exception:
+                    item["color"] = None
+            borders[side] = item
+        entry["borders"] = borders
+    return entry
+
+
+def read_format(
+    target: ResolvedTarget,
+    *,
+    address: str,
+    max_cells: int,
+    include_borders: bool = False,
+) -> dict[str, Any]:
+    range_object = _range(target, address)
+    rows, columns = _dims(range_object)
+    check_cell_limit(rows * columns, max_cells)
+    try:
+        top_row = int(range_object.Row)
+        left_column = int(range_object.Columns(1).Column)
+    except pywintypes.com_error as exc:
+        raise _range_error(exc) from exc
+    cells: list[dict[str, Any]] = []
+    for row in range(1, rows + 1):
+        for column in range(1, columns + 1):
+            try:
+                cell = range_object.Cells(row, column)
+            except pywintypes.com_error as exc:
+                raise _range_error(exc) from exc
+            entry = {
+                "cell": f"{_column_letter(left_column + column - 1)}{top_row + row - 1}"
+            }
+            entry.update(_cell_format(cell, include_borders))
+            cells.append(entry)
+    return {
+        "address": _address(range_object),
+        "rows": rows,
+        "columns": columns,
+        "cell_count": rows * columns,
+        "borders": include_borders,
+        "cells": cells,
+    }

@@ -22,15 +22,20 @@ app = typer.Typer(
 excel_app = typer.Typer(help="Excel commands.", no_args_is_help=True)
 excel_range_app = typer.Typer(help="Excel range commands.", no_args_is_help=True)
 excel_workbook_app = typer.Typer(help="Excel workbook commands.", no_args_is_help=True)
+excel_rows_app = typer.Typer(help="Excel whole-row commands.", no_args_is_help=True)
+excel_columns_app = typer.Typer(help="Excel whole-column commands.", no_args_is_help=True)
 word_app = typer.Typer(help="Word commands.", no_args_is_help=True)
 word_selection_app = typer.Typer(help="Word selection commands.", no_args_is_help=True)
 word_document_app = typer.Typer(help="Word document commands.", no_args_is_help=True)
+word_paragraphs_app = typer.Typer(help="Word paragraph-list commands.", no_args_is_help=True)
+word_paragraph_app = typer.Typer(help="Word single-paragraph commands.", no_args_is_help=True)
 powerpoint_app = typer.Typer(help="PowerPoint commands.", no_args_is_help=True)
 powerpoint_slide_app = typer.Typer(help="PowerPoint slide commands.", no_args_is_help=True)
 powerpoint_slides_app = typer.Typer(
     help="PowerPoint presentation-wide slide commands.", no_args_is_help=True
 )
 powerpoint_text_app = typer.Typer(help="PowerPoint text commands.", no_args_is_help=True)
+powerpoint_shape_app = typer.Typer(help="PowerPoint shape commands.", no_args_is_help=True)
 powerpoint_textbox_app = typer.Typer(
     help="PowerPoint text box commands.", no_args_is_help=True
 )
@@ -50,13 +55,18 @@ target_app = typer.Typer(
 app.add_typer(excel_app, name="excel")
 excel_app.add_typer(excel_range_app, name="range")
 excel_app.add_typer(excel_workbook_app, name="workbook")
+excel_app.add_typer(excel_rows_app, name="rows")
+excel_app.add_typer(excel_columns_app, name="columns")
 app.add_typer(word_app, name="word")
 word_app.add_typer(word_selection_app, name="selection")
 word_app.add_typer(word_document_app, name="document")
+word_app.add_typer(word_paragraphs_app, name="paragraphs")
+word_app.add_typer(word_paragraph_app, name="paragraph")
 app.add_typer(powerpoint_app, name="powerpoint")
 powerpoint_app.add_typer(powerpoint_slide_app, name="slide")
 powerpoint_app.add_typer(powerpoint_slides_app, name="slides")
 powerpoint_app.add_typer(powerpoint_text_app, name="text")
+powerpoint_app.add_typer(powerpoint_shape_app, name="shape")
 powerpoint_app.add_typer(powerpoint_textbox_app, name="textbox")
 powerpoint_app.add_typer(powerpoint_notes_app, name="notes")
 powerpoint_app.add_typer(powerpoint_document_app, name="document")
@@ -568,6 +578,11 @@ def excel_range_copy_format(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Validate the ranges without changing formatting."
     ),
+    borders: bool = typer.Option(
+        False,
+        "--borders",
+        help="Re-apply cell borders cell by cell after the paste (this build does not propagate borders through a format paste).",
+    ),
     yes: bool = typer.Option(
         False, "--yes", help="Skip the interactive confirmation prompt."
     ),
@@ -583,6 +598,8 @@ def excel_range_copy_format(
         "address": address,
         "dry_run": dry_run,
     }
+    if borders:
+        params["borders"] = True
     if expected_document:
         params["expected_document"] = expected_document
 
@@ -817,10 +834,206 @@ def excel_range_sort(
     _run(ctx, action)
 
 
+@excel_range_app.command("read-format")
+def excel_range_read_format(
+    ctx: typer.Context,
+    address: str = typer.Argument(
+        ..., help="A1-style range; every cell is read individually, so keep it small."
+    ),
+    borders: bool = typer.Option(
+        False,
+        "--borders",
+        help="Include per-side border style, weight and color.",
+    ),
+) -> None:
+    """Read cell formatting (fill, font, number format) with RRGGBB colors."""
+    params: dict[str, Any] = {"address": address}
+    if borders:
+        params["borders"] = True
+    _run(ctx, lambda client: client.inspect("excel.range.format", params))
+
+
 @excel_workbook_app.command("inspect")
 def excel_workbook_inspect(ctx: typer.Context) -> None:
     """Read workbook metadata and worksheet names."""
     _run(ctx, lambda client: client.inspect("excel.workbook", {}))
+
+
+def _run_structural(
+    ctx: typer.Context,
+    operation: str,
+    spec: str,
+    spec_param: str,
+    shift: str | None,
+    dry_run: bool,
+    yes: bool,
+    expected_document: str | None,
+) -> None:
+    params: dict[str, Any] = {spec_param: spec, "dry_run": dry_run}
+    if shift:
+        params["shift"] = shift
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                verb = "insert" if operation.endswith("insert") else "delete"
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"{verb} whole {spec_param}(s) {spec} on the active sheet",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke(operation, params)
+
+    _run(ctx, action)
+
+
+@excel_rows_app.command("insert")
+def excel_rows_insert(
+    ctx: typer.Context,
+    spec: str = typer.Argument(
+        ..., help='Rows to insert: a row number ("61") or a "first:last" range ("2:4").'
+    ),
+    shift: str = typer.Option(None, "--shift", help="down (default) or right."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the resolved rows without changing the sheet."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Insert whole rows at the given row on the active sheet."""
+    _run_structural(
+        ctx, "excel.rows.insert", spec, "row", shift, dry_run, yes, expected_document
+    )
+
+
+@excel_rows_app.command("delete")
+def excel_rows_delete(
+    ctx: typer.Context,
+    spec: str = typer.Argument(
+        ..., help='Rows to delete: a row number ("61") or a "first:last" range ("2:4").'
+    ),
+    shift: str = typer.Option(
+        None, "--shift", help="Omit for the reliable no-shift call; up or left to force one."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the resolved rows without changing the sheet."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Delete whole rows on the active sheet. Confirm the exact rows with the user."""
+    _run_structural(
+        ctx, "excel.rows.delete", spec, "row", shift, dry_run, yes, expected_document
+    )
+
+
+@excel_rows_app.command("move")
+def excel_rows_move(
+    ctx: typer.Context,
+    spec: int = typer.Argument(..., help="1-based row to move."),
+    to: int = typer.Option(
+        ..., "--to", help="Destination row number (rows between shift toward the source)."
+    ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned move without changing the sheet."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Move one whole row (values, formatting and hyperlinks travel with it)."""
+    params: dict[str, Any] = {"row": spec, "to": to, "dry_run": dry_run}
+    if sheet:
+        params["sheet"] = sheet
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                where = f" on sheet {sheet!r}" if sheet else " on the active sheet"
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"move row {spec} to {to}{where}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("excel.rows.move", params)
+
+    _run(ctx, action)
+
+
+@excel_columns_app.command("insert")
+def excel_columns_insert(
+    ctx: typer.Context,
+    spec: str = typer.Argument(
+        ..., help='Columns to insert: a letter ("C"), an index ("3"), or "A:C".'
+    ),
+    shift: str = typer.Option(None, "--shift", help="right (default) or down."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the resolved columns without changing the sheet."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Insert whole columns at the given column on the active sheet."""
+    _run_structural(
+        ctx, "excel.columns.insert", spec, "column", shift, dry_run, yes, expected_document
+    )
+
+
+@excel_columns_app.command("delete")
+def excel_columns_delete(
+    ctx: typer.Context,
+    spec: str = typer.Argument(
+        ..., help='Columns to delete: a letter ("C"), an index ("3"), or "A:C".'
+    ),
+    shift: str = typer.Option(
+        None, "--shift", help="Omit for the reliable no-shift call; up or left to force one."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the resolved columns without changing the sheet."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Delete whole columns on the active sheet. Confirm the exact columns with the user."""
+    _run_structural(
+        ctx, "excel.columns.delete", spec, "column", shift, dry_run, yes, expected_document
+    )
 
 
 @word_selection_app.command("read")
@@ -884,6 +1097,142 @@ def word_document_read(ctx: typer.Context) -> None:
     _run(ctx, lambda client: client.inspect("word.document", {}))
 
 
+@word_paragraphs_app.command("read")
+def word_paragraphs_read(
+    ctx: typer.Context,
+    start: int = typer.Option(1, "--start", help="1-based first paragraph number."),
+    count: int = typer.Option(50, "--count", help="Paragraphs to read (max 200)."),
+) -> None:
+    """Read a window of Word paragraphs with style names and heading flags."""
+    _run(
+        ctx,
+        lambda client: client.inspect(
+            "word.paragraphs", {"start": start, "count": count}
+        ),
+    )
+
+
+@word_app.command("find")
+def word_find(
+    ctx: typer.Context,
+    text: str = typer.Argument(..., help="Text to search for in the document body."),
+    match_case: bool = typer.Option(False, "--match-case", help="Match letter case."),
+    whole_words: bool = typer.Option(
+        False, "--whole-words", help="Match whole words only."
+    ),
+    max: int = typer.Option(50, "--max", help="Maximum matches to report."),
+) -> None:
+    """Search the document body and report each match's paragraph and context."""
+    params: dict[str, Any] = {"find": text, "max": max}
+    if match_case:
+        params["match_case"] = True
+    if whole_words:
+        params["whole_words"] = True
+    _run(ctx, lambda client: client.inspect("word.find", params))
+
+
+@word_app.command("replace")
+def word_replace(
+    ctx: typer.Context,
+    find: str = typer.Argument(..., help="Text to find (literal, no wildcards)."),
+    replace: str = typer.Option(
+        ...,
+        "--replace-with",
+        help="Replacement text (empty string deletes the match).",
+    ),
+    match_case: bool = typer.Option(False, "--match-case", help="Match letter case."),
+    whole_words: bool = typer.Option(
+        False, "--whole-words", help="Match whole words only."
+    ),
+    nth: int = typer.Option(
+        None,
+        "--nth",
+        help="Replace only this 1-based match number instead of all matches.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the match count without changing anything."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Replace text throughout the Word body via Word's own Find/Replace."""
+    params: dict[str, Any] = {"find": find, "replace": replace, "dry_run": dry_run}
+    if match_case:
+        params["match_case"] = True
+    if whole_words:
+        params["whole_words"] = True
+    if nth is not None:
+        params["nth"] = nth
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                scope = f"match #{nth}" if nth is not None else "all matches of"
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"replace {scope} {find!r} with {replace!r}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("word.replace", params)
+
+    _run(ctx, action)
+
+
+@word_paragraph_app.command("replace")
+def word_paragraph_replace(
+    ctx: typer.Context,
+    paragraph: int = typer.Argument(..., help="1-based paragraph number."),
+    text: str = typer.Option(
+        ..., "--text", help="New paragraph text, or '@path' to read from a UTF-8 file."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview the current text without changing it."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive confirmation prompt."),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Replace one Word paragraph's body text (keeps the paragraph break)."""
+    params: dict[str, Any] = {
+        "paragraph": paragraph,
+        "text": _resolve_text_argument(text),
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"set paragraph {paragraph} to {len(params['text'])} characters",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("word.paragraph.replace_text", params)
+
+    _run(ctx, action)
+
+
 @powerpoint_slide_app.command("delete")
 def powerpoint_slide_delete(
     ctx: typer.Context,
@@ -921,6 +1270,48 @@ def powerpoint_slide_delete(
                     raise typer.Exit(1)
             params["confirm"] = True
         return client.invoke("powerpoint.slide.delete", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_slide_app.command("move")
+def powerpoint_slide_move(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number to move."),
+    to: int = typer.Option(..., "--to", help="1-based destination position."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the slide title and direction without moving it.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Move a slide to a new position in the presentation."""
+    params: dict[str, Any] = {"slide": slide, "to": to, "dry_run": dry_run}
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"move slide {slide} to position {to}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.slide.move", params)
 
     _run(ctx, action)
 
@@ -1104,6 +1495,120 @@ def powerpoint_text_replace(
                     raise typer.Exit(1)
             params["confirm"] = True
         return client.invoke("powerpoint.text.replace", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_shape_app.command("delete")
+def powerpoint_shape_delete(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the shape name, type and text without deleting it.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Delete a shape. Rollback needs 'office undo' before any further action; confirm first."""
+    params: dict[str, Any] = {
+        "slide": slide,
+        "shape": _shape_argument(shape),
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"delete shape {shape} on slide {slide} (ask the user to confirm this exact shape)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.shape.delete", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_shape_app.command("set-format")
+def powerpoint_shape_set_format(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    font_size: float = typer.Option(
+        None, "--font-size", help="Font size in points (1-400)."
+    ),
+    font_name: str = typer.Option(None, "--font-name", help="Font name."),
+    color: str = typer.Option(None, "--color", help="Font color as RRGGBB hex."),
+    bold: bool = typer.Option(
+        None,
+        "--bold/--no-bold",
+        help="Set or clear bold.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the current font values and the planned change.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Set the text font of one shape (text only; shape outline and fill stay)."""
+    params: dict[str, Any] = {"slide": slide, "shape": _shape_argument(shape), "dry_run": dry_run}
+    if font_size is not None:
+        params["font_size"] = font_size
+    if font_name is not None:
+        params["font_name"] = font_name
+    if color is not None:
+        params["color"] = color
+    if bold is not None:
+        params["bold"] = bold
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"set text font on shape {shape} of slide {slide}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.shape.set_format", params)
 
     _run(ctx, action)
 

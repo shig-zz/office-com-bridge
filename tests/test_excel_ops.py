@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 from types import SimpleNamespace
 
+import pywintypes
 import pytest
 
 from office_bridge.errors import BridgeError, ErrorCode
@@ -58,6 +59,7 @@ class FakeRange:
         formulas=None,
         address: str = "A1:B2",
         areas: list["FakeRange"] | None = None,
+        cells: list[list] | None = None,
     ) -> None:
         self.Rows = SimpleNamespace(Count=rows)
         self.Columns = SimpleNamespace(Count=columns)
@@ -85,6 +87,12 @@ class FakeRange:
         self.Hyperlinks = FakeHyperlinks()
         self.copied = False
         self.pasted_with = None
+        self._cells = cells
+
+    def Cells(self, row: int, column: int):
+        if self._cells is None:
+            raise AttributeError("this fake range has no per-cell grid")
+        return self._cells[row - 1][column - 1]
 
     def Copy(self) -> None:
         self.copied = True
@@ -718,9 +726,18 @@ def test_parse_sort_key_rejects_out_of_range_and_bad_order() -> None:
 
 
 class FakeSortRow:
-    def __init__(self, sheet: "FakeSortSheet", row: int) -> None:
+    def __init__(self, sheet: "FakeSortSheet", row: int, count: int = 1) -> None:
         self._sheet = sheet
         self._row = row
+        self._count = count
+
+    @property
+    def Row(self) -> int:
+        return self._row
+
+    @property
+    def Rows(self) -> SimpleNamespace:
+        return SimpleNamespace(Count=self._count)
 
     def Copy(self) -> None:
         # whole-row copy: the entire row goes on the clipboard
@@ -729,10 +746,12 @@ class FakeSortRow:
         self._sheet.clip_left = 0
 
     def Insert(self, shift: int = -4121) -> None:
-        self._sheet._insert_row(self._row)
+        for offset in range(self._count):
+            self._sheet._insert_row(self._row + offset)
 
     def Delete(self, shift: int = -4121) -> None:
-        self._sheet._delete_row(self._row)
+        for offset in reversed(range(self._count)):
+            self._sheet._delete_row(self._row + offset)
 
     @property
     def RowHeight(self) -> float | None:
@@ -854,6 +873,7 @@ class FakeSortSheet:
         width = len(self.grid[0]) if self.grid else 0
         self.heights = list(heights) if heights else [24.0] * len(self.grid)
         self._width = width
+        self.Name = "Sheet1"
         self.clipboard: list | None = None
         self.clip_left = 0
         self.copies = 0
@@ -864,12 +884,26 @@ class FakeSortSheet:
         # sheets of the installed build); per-row reads normally still work
         self.unknown_height_rows: set[int] = set()
 
+    @property
+    def UsedRange(self) -> SimpleNamespace:
+        # Inserted blank rows count as used on the installed build, so the
+        # used range spans the whole grid.
+        return SimpleNamespace(
+            Row=1,
+            Rows=SimpleNamespace(Count=len(self.grid)),
+            Column=1,
+            Columns=SimpleNamespace(Count=self._width),
+        )
+
     def Range(self, address: str) -> FakeSheetRange:
         top, left, nrows, ncols = _parse_a1(address)
         return FakeSheetRange(self, top, left, nrows, ncols)
 
-    def Rows(self, row: int) -> FakeSortRow:
-        return FakeSortRow(self, row)
+    def Rows(self, row: int | str) -> FakeSortRow:
+        if isinstance(row, str) and ":" in row:
+            first, last = (int(part) for part in row.split(":"))
+            return FakeSortRow(self, first, last - first + 1)
+        return FakeSortRow(self, int(row))
 
     def _insert_row(self, row: int) -> None:
         self.inserts += 1
@@ -908,7 +942,7 @@ def make_sort_target(sheet: FakeSortSheet) -> SimpleNamespace:
     sheet.application = application
     window = SimpleNamespace(
         RangeSelection=FakeRange(1, 1, None),
-        ActiveSheet=SimpleNamespace(Range=sheet.Range),
+        ActiveSheet=sheet,
     )
     target = make_target(window)
     target.application = application
@@ -1078,3 +1112,424 @@ def test_sort_range_rejects_bad_keys_parameter() -> None:
                 params={},
             )
         assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: structural writes, format reads, copy-format borders
+
+
+def test_rows_insert_dry_run_and_apply() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    dry = excel.insert_or_delete(
+        target,
+        dimension="rows",
+        spec="2:4",
+        shift=None,
+        mode="insert",
+        dry_run=True,
+        params={},
+    )
+    assert dry["first"] == 2
+    assert dry["count"] == 3
+    assert dry["shift"] == "down"
+    assert dry["applied"] is False
+    assert len(sheet.grid) == 7
+
+    result = excel.insert_or_delete(
+        target,
+        dimension="rows",
+        spec="2:4",
+        shift=None,
+        mode="insert",
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert result["applied"] is True
+    assert result["verified"] is True
+    assert result["last_used_after"] == 10
+    assert "undo_hint" in result
+    assert len(sheet.grid) == 10
+
+
+def test_rows_insert_requires_confirmation() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.insert_or_delete(
+            target,
+            dimension="rows",
+            spec=2,
+            shift=None,
+            mode="insert",
+            dry_run=False,
+            params={},
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert sheet.inserts == 0
+
+
+def test_rows_insert_rejects_bad_specs() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    for bad in (0, "4:2", "x", True, 2.5):
+        with pytest.raises(BridgeError) as excinfo:
+            excel.insert_or_delete(
+                target,
+                dimension="rows",
+                spec=bad,
+                shift=None,
+                mode="insert",
+                dry_run=True,
+                params={},
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_rows_delete_verifies_and_shrinks_grid() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    result = excel.insert_or_delete(
+        target,
+        dimension="rows",
+        spec=6,
+        shift=None,
+        mode="delete",
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert result["applied"] is True
+    assert result["verified"] is True
+    assert result["last_used_after"] == 6
+    assert len(sheet.grid) == 6
+    assert sheet.grid[5][0] == "BOTTOM"
+
+
+def test_rows_delete_rejects_bad_shift() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.insert_or_delete(
+            target,
+            dimension="rows",
+            spec=2,
+            shift="sideways",
+            mode="delete",
+            dry_run=True,
+            params={},
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+class FakeColumnBlock:
+    def __init__(self, sheet: "FakeColumnSheet", first: int, count: int) -> None:
+        self._sheet = sheet
+        self._first = first
+        self._count = count
+
+    @property
+    def Column(self) -> int:
+        return self._first
+
+    @property
+    def Columns(self) -> SimpleNamespace:
+        return SimpleNamespace(Count=self._count)
+
+    def Insert(self, shift: int = -4161) -> None:
+        self._sheet.width += self._count
+
+    def Delete(self, shift: int = -4121) -> None:
+        self._sheet.width -= self._count
+
+
+class FakeColumnSheet:
+    def __init__(self, width: int = 5) -> None:
+        self.width = width
+        self.Name = "Columns1"
+
+    @property
+    def UsedRange(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            Row=1,
+            Rows=SimpleNamespace(Count=3),
+            Column=1,
+            Columns=SimpleNamespace(Count=self.width),
+        )
+
+    def Columns(self, spec: int | str) -> FakeColumnBlock:
+        if isinstance(spec, str):
+            if ":" in spec:
+                first, last = (excel._letter_column(part) for part in spec.split(":"))
+            else:
+                first = last = excel._letter_column(spec)
+            return FakeColumnBlock(self, first, last - first + 1)
+        return FakeColumnBlock(self, int(spec), 1)
+
+
+def make_column_target(sheet: FakeColumnSheet) -> SimpleNamespace:
+    window = SimpleNamespace(RangeSelection=None, ActiveSheet=sheet)
+    return make_target(window)
+
+
+def test_columns_insert_by_letter_and_delete_by_range() -> None:
+    sheet = FakeColumnSheet(width=5)
+    target = make_column_target(sheet)
+    result = excel.insert_or_delete(
+        target,
+        dimension="columns",
+        spec="C",
+        shift=None,
+        mode="insert",
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert result["first"] == 3
+    assert result["shift"] == "right"
+    assert result["verified"] is True
+    assert sheet.width == 6
+
+    deleted = excel.insert_or_delete(
+        target,
+        dimension="columns",
+        spec="A:C",
+        shift=None,
+        mode="delete",
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert deleted["count"] == 3
+    assert deleted["verified"] is True
+    assert sheet.width == 3
+
+
+def test_move_row_up_applies_and_verifies() -> None:
+    sheet = FakeSortSheet([["a", 1], ["b", 2], ["c", 3], ["d", 4]])
+    target = make_sort_target(sheet)
+    result = excel.move_rows(
+        target, row=4, to=2, sheet_name=None, dry_run=False, params={"confirm": True}
+    )
+    assert result["applied"] is True
+    assert result["verified"] is True
+    assert result["direction"] == "up"
+    assert result["completed_steps"] == ["copy", "insert", "clear_clipboard", "delete_original"]
+    assert sheet.grid == [["a", 1], ["d", 4], ["b", 2], ["c", 3]]
+
+
+def test_move_row_down_applies_and_verifies() -> None:
+    sheet = FakeSortSheet([["a", 1], ["b", 2], ["c", 3], ["d", 4]])
+    target = make_sort_target(sheet)
+    result = excel.move_rows(
+        target, row=2, to=4, sheet_name=None, dry_run=False, params={"confirm": True}
+    )
+    assert result["applied"] is True
+    assert result["verified"] is True
+    assert result["direction"] == "down"
+    assert sheet.grid == [["a", 1], ["c", 3], ["d", 4], ["b", 2]]
+    assert "undo_note" in result
+
+
+def test_move_row_requires_confirmation() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.move_rows(
+            target, row=2, to=5, sheet_name=None, dry_run=False, params={}
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert sheet.copies == 0
+
+
+def test_move_row_dry_run_reports_plan() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    result = excel.move_rows(
+        target, row=6, to=2, sheet_name=None, dry_run=True, params={}
+    )
+    assert result["direction"] == "up"
+    assert result["steps"] == ["copy", "insert", "clear_clipboard", "delete_original"]
+    assert sheet.copies == 0
+
+
+def test_move_row_rejects_out_of_range() -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.move_rows(
+            target, row=99, to=2, sheet_name=None, dry_run=True, params={}
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    with pytest.raises(BridgeError) as same_exc:
+        excel.move_rows(
+            target, row=2, to=2, sheet_name=None, dry_run=True, params={}
+        )
+    assert same_exc.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_move_row_partial_failure_reports_completed_steps(monkeypatch) -> None:
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+
+    def boom(self, shift: int = -4121) -> None:  # noqa: ANN001
+        raise pywintypes.com_error(-2147352567, "boom", None, None, 0, None)
+
+    monkeypatch.setattr(FakeSortRow, "Delete", boom)
+    with pytest.raises(BridgeError) as excinfo:
+        excel.move_rows(
+            target, row=6, to=2, sheet_name=None, dry_run=False, params={"confirm": True}
+        )
+    assert excinfo.value.code == ErrorCode.RANGE_INVALID
+    assert excinfo.value.details["completed_steps"] == [
+        "copy",
+        "insert",
+        "clear_clipboard",
+    ]
+
+
+class FakeBorder:
+    def __init__(self, style: int = -4142, weight: int | None = None, color: int | None = None) -> None:
+        self.LineStyle = style
+        self.Weight = weight
+        self.Color = color
+
+
+class FakeBorderSet:
+    def __init__(self, borders: dict[int, FakeBorder] | None = None) -> None:
+        self._borders = dict(borders or {})
+
+    def __call__(self, position: int) -> FakeBorder:
+        if position not in self._borders:
+            self._borders[position] = FakeBorder()
+        return self._borders[position]
+
+
+class _FormatColumns:
+    def __init__(self, count: int, left: int) -> None:
+        self.Count = count
+        self._left = left
+
+    def __call__(self, index: int) -> SimpleNamespace:
+        return SimpleNamespace(Column=self._left + index - 1)
+
+
+def make_format_cell(
+    fill: int | None = None,
+    pattern: int = -4142,
+    font_color: int | None = None,
+    borders: dict[int, FakeBorder] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        Interior=SimpleNamespace(Pattern=pattern, Color=fill),
+        Font=SimpleNamespace(Name="Meiryo", Size=12.0, Bold=True, Color=font_color),
+        NumberFormat="0.0%",
+        HorizontalAlignment=-4108,
+        VerticalAlignment=-4108,
+        WrapText=False,
+        Borders=FakeBorderSet(borders),
+    )
+
+
+class FakeFormatRange:
+    def __init__(self, cells: list[list], top: int, left: int, address: str) -> None:
+        self._cells = cells
+        self.Rows = SimpleNamespace(Count=len(cells))
+        self.Columns = _FormatColumns(len(cells[0]), left)
+        self._row = top
+        self._address = address
+
+    @property
+    def Row(self) -> int:
+        return self._row
+
+    def Cells(self, row: int, column: int):
+        return self._cells[row - 1][column - 1]
+
+    def Address(self, row_absolute: bool = True, column_absolute: bool = True) -> str:
+        return self._address
+
+
+def make_format_target(cells: list[list], top: int = 2, left: int = 2, address: str = "B2") -> SimpleNamespace:
+    fmt_range = FakeFormatRange(cells, top=top, left=left, address=address)
+    window = FakeWindow(FakeRange(1, 1, None), {address: fmt_range})
+    return make_target(window)
+
+
+def test_read_format_reads_cells_with_hex_colors() -> None:
+    plain = make_format_cell()
+    filled = make_format_cell(fill=0x0000FA, pattern=1, font_color=255)
+    target = make_format_target([[filled, plain], [plain, plain]], address="B2:C3")
+    result = excel.read_format(target, address="B2:C3", max_cells=100)
+    assert result["address"] == "B2:C3"
+    assert result["cell_count"] == 4
+    assert result["borders"] is False
+    first = result["cells"][0]
+    assert first["cell"] == "B2"
+    assert first["fill"] == "FA0000"  # stored BGR 0000FA -> RRGGBB FA0000
+    assert first["font"] == {"name": "Meiryo", "size": 12.0, "bold": True, "color": "FF0000"}
+    assert first["number_format"] == "0.0%"
+    assert "borders" not in first
+    assert result["cells"][1]["cell"] == "C2"
+    assert result["cells"][1]["fill"] is None
+    assert result["cells"][3]["cell"] == "C3"
+
+
+def test_read_format_includes_borders_when_requested() -> None:
+    cell = make_format_cell(borders={9: FakeBorder(style=1, weight=4, color=0x303030)})
+    target = make_format_target([[cell]], address="B2")
+    result = excel.read_format(target, address="B2", max_cells=10, include_borders=True)
+    borders = result["cells"][0]["borders"]
+    assert borders["bottom"]["style"] == "continuous"
+    assert borders["bottom"]["weight"] == 4
+    assert borders["bottom"]["color"] == "303030"
+    assert borders["top"]["style"] == "none"
+    assert "weight" not in borders["top"]
+
+
+def test_read_format_respects_cell_limit() -> None:
+    cell = make_format_cell()
+    target = make_format_target([[cell, cell], [cell, cell]], address="B2:C3")
+    with pytest.raises(BridgeError) as excinfo:
+        excel.read_format(target, address="B2:C3", max_cells=3)
+    assert excinfo.value.code == ErrorCode.RANGE_TOO_LARGE
+
+
+def test_copy_format_default_reports_borders_note() -> None:
+    source = FakeRange(1, 1, None, address="A1")
+    dest = FakeRange(1, 1, None, address="C1")
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"A1": source, "C1": dest}))
+    result = excel.copy_format(
+        target,
+        source_address="A1",
+        address="C1",
+        dry_run=False,
+        max_cells=10,
+        params={"confirm": True},
+    )
+    assert result["copied"] is True
+    assert result["borders_applied"] is False
+    assert "borders" in result["borders_note"]
+
+
+def test_copy_format_borders_restores_per_cell() -> None:
+    source_cell = SimpleNamespace(
+        Borders=FakeBorderSet(
+            {9: FakeBorder(style=1, weight=4, color=0x303030)}
+        )
+    )
+    dest_cell = SimpleNamespace(Borders=FakeBorderSet())
+    source = FakeRange(1, 1, None, address="A1", cells=[[source_cell]])
+    dest = FakeRange(1, 1, None, address="C1", cells=[[dest_cell]])
+    target = make_target(FakeWindow(FakeRange(1, 1, None), {"A1": source, "C1": dest}))
+    result = excel.copy_format(
+        target,
+        source_address="A1",
+        address="C1",
+        dry_run=False,
+        max_cells=10,
+        params={"confirm": True},
+        include_borders=True,
+    )
+    assert result["borders_applied"] is True
+    bottom = dest_cell.Borders(9)
+    assert bottom.LineStyle == 1
+    assert bottom.Weight == 4
+    assert bottom.Color == 0x303030

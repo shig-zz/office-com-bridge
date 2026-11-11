@@ -58,8 +58,11 @@ Prefer the narrowest read that answers the question. The examples below omit
 | Current document summary | `office inspect document` |
 | Excel range values | `office excel range read "A1:D20"` |
 | Excel range values and formulas | `office excel range read "A1:D20" --formulas` |
+| Excel cell formatting (fill, font, borders) | `office excel range read-format "A1:D20" --borders` |
 | Excel workbook and sheet names | `office excel workbook inspect` |
 | Word selected text | `office word selection read` |
+| Word paragraph structure (styles, headings) | `office word paragraphs read --start 1 --count 50` |
+| Word text search with paragraph locations | `office word find "用語"` |
 | Word document counts | `office word document read` |
 | Current PowerPoint slide and shapes | `office powerpoint slide inspect` |
 | PowerPoint slides with notes and shape geometry | `office powerpoint slides read --start 1 --count 20` |
@@ -93,6 +96,8 @@ office undo --yes --expected-document "Deck.pptx"
 ```
 
 Never use undo to quietly clean up a failed write without the user's approval.
+Destructive writes (`slide delete`, `shape delete`, `rows/columns delete`) return
+an `undo_hint` field; pass it on to the user when reporting the result.
 
 `undoable` comes from `application.Undoable`. When the application does not
 expose it (this PowerPoint build returns `null`), dry-run cannot tell you
@@ -121,11 +126,12 @@ Excel formatting:
 Formatting writes are allow-listed and require `confirm=true`, exactly like value
 writes. Use `--dry-run` first to preview which properties will change.
 
-Copy the formatting of one range onto another (values are never changed):
+Copy the formatting of one range onto another (values are never changed). Cell
+borders need `--borders` on this build (see the rules below):
 
 ```text
-office excel range copy-format "A1:B2" "C1:D2" --dry-run --expected-document "Budget.xlsx"
-office excel range copy-format "A1:B2" "C1:D2" --yes --expected-document "Budget.xlsx"
+office excel range copy-format "A1:B2" "C1:D2" --borders --dry-run --expected-document "Budget.xlsx"
+office excel range copy-format "A1:B2" "C1:D2" --borders --yes --expected-document "Budget.xlsx"
 ```
 
 Set explicit formatting properties on a range:
@@ -153,8 +159,11 @@ Rules for formatting writes:
 - In this build `copy-format` does not propagate cell borders: a solid edge
   border on the source (for example the bottom rule of `H78`) can stay missing
   on the target (`H82`) after the copy. Font, fill, and number format do travel;
-  borders do not. After copying, verify borders cell by cell and restore them
-  with `com set` (see "Reading and writing borders") or `set-format --border`.
+  borders do not. Pass `--borders` and the operation re-applies the source's
+  per-cell border style, weight and color after the paste (reported as
+  `borders_applied: true`); the default response says this in `borders_note`.
+  Restore them with `com set` (see "Reading and writing borders") or
+  `set-format --border` instead only when you need a different look.
 - Prefer `copy-format` from a well-formatted reference cell over guessing many
   `set-format` options.
 - Excel has no separate far-east font option: choose `--font-name` with a
@@ -164,6 +173,12 @@ Rules for formatting writes:
 - Do not change formatting outside the range the user named.
 
 Reading fills:
+
+For auditing formatting, prefer the curated read: `office excel range read-format
+"A1:D20" --borders` reads every cell individually and returns colors already
+converted to `RRGGBB` hex, plus per-side border `style`/`weight`/`color`. Keep
+the range small (every cell is a separate COM read). The raw-COM notes below
+explain why multi-cell reads are unreliable and still apply to `com get`.
 
 A multi-cell `Interior.Color` read is unreliable in this build: a uniform
 range returns the color as a scalar, a mixed range returns 0. Read fills cell
@@ -246,6 +261,41 @@ office excel range sort "A2:E54" -c 3 -c B -o ascending -o descending --dry-run 
 - Do not try to sort through `office com` with `.Sort(...)`: it succeeds
   silently and changes nothing.
 
+Excel row and column structure:
+
+Insert or delete whole rows/columns with the curated commands. The shift enums
+are applied for you, and only whole rows/columns can be deleted (range-limited
+deletes stay unavailable):
+
+```text
+office excel rows insert "2:4" --dry-run --expected-document "MovieLog.xlsx"
+office excel rows insert "2:4" --yes --expected-document "MovieLog.xlsx"
+office excel rows delete 61 --yes --expected-document "MovieLog.xlsx"
+office excel columns insert C --yes --expected-document "MovieLog.xlsx"
+office excel columns delete "A:C" --yes --expected-document "MovieLog.xlsx"
+```
+
+- A row spec is a number (`61`) or a `"first:last"` range (`"2:4"`); a column
+  spec is a letter (`C`), an index (`3`), or `"A:C"`.
+- Dry-run reports the resolved `first`/`count` and the shift used; the run
+  re-reads the used range and reports `verified`, and carries an `undo_hint`.
+
+Move one whole row with `excel rows move` instead of a hand-built choreography:
+
+```text
+office excel rows move 61 --to 60 --dry-run --expected-document "MovieLog.xlsx"
+office excel rows move 61 --to 60 --yes --expected-document "MovieLog.xlsx"
+```
+
+- It runs the proven copy → insert → clear-clipboard → delete-original steps as
+  one operation, and the moved row lands exactly at `--to`. The result reports
+  `completed_steps` and `verified` (the moved row is read back against the
+  original values); values, formatting and hyperlinks travel with the row.
+- A mid-move failure returns `RANGE_INVALID` with the `completed_steps` done so
+  far: re-read the sheet before any cleanup, and remember one undo reverts only
+  the last step.
+- The move uses the clipboard, so no other clipboard work may run concurrently.
+
 Word insertion:
 
 ```text
@@ -254,6 +304,34 @@ office word selection insert-text "追記します。" --yes --expected-document
 ```
 
 `--replace` is the default; use `--no-replace` only when the user explicitly wants insertion at the start of the selection.
+
+Word structure, search and replace:
+
+```text
+office word paragraphs read --start 1 --count 50
+office word find "旧表記" --match-case
+office word replace "旧表記" --replace-with "新表記" --dry-run --expected-document "Report.docx"
+office word replace "旧表記" --replace-with "新表記" --yes --expected-document "Report.docx"
+office word replace "旧表記" --replace-with "新表記" --nth 3 --yes --expected-document "Report.docx"
+office word paragraph replace 12 --text "新しい本文" --dry-run --expected-document "Report.docx"
+office word paragraph replace 12 --text "新しい本文" --yes --expected-document "Report.docx"
+```
+
+- `paragraphs read` returns the paragraph window with style names and an
+  `is_heading` flag — use it instead of dumping `document.Content.Text` and
+  grepping. Up to 200 paragraphs per call.
+- `find` is read-only (no confirmation): every match carries its paragraph
+  number and a text snippet. `--match-case` / `--whole-words` narrow the search
+  (Word's own defaults are case-insensitive partial matching).
+- `replace` runs Word's own Find/Replace, so formatting is preserved and, when
+  Track Changes is on, the replacement is recorded as a tracked change
+  (dry-run reports that in `note`). Dry-run reports `occurrences_before` and the
+  first paragraph; the run re-scans and reports `verified`. `--nth K` replaces
+  only the K-th match instead of all of them.
+- `paragraph replace` rewrites one paragraph's body text by 1-based number and
+  keeps the paragraph break. Newlines in `--text` split the paragraph, and
+  dry-run reports `paragraph_count_before/after` for that. Prefer `word replace`
+  for in-place edits; editing paragraphs inside tables or fields is unreliable.
 
 PowerPoint slide text:
 
@@ -305,6 +383,21 @@ expressions. On this Office build the object model behaves as follows:
   but only while the delete is still Office's most recent action and only after
   the user approves the undo, so confirm the slide up front rather than counting
   on undo.
+- Reorder with `powerpoint slide move <n> --to m` (write workflow applies):
+  dry-run reports the title and direction, the run verifies the same `SlideID`
+  now sits at position `m`. Typical use is gathering correction-note slides at
+  the end of a deck.
+- Delete a shape with `powerpoint shape delete <n> --shape <index|name>` (write
+  workflow applies). Dry-run reports the shape's `shape_name`, `shape_type` and
+  a `text_preview` so the exact shape is confirmed with the user; the run
+  verifies the shape count dropped by one and carries an `undo_hint` — same
+  caution as slide delete.
+- Change a shape's text font with `powerpoint shape set-format <n> --shape
+  <index|name> [--font-size N] [--font-name NAME] [--color RRGGBB]
+  [--bold/--no-bold]`: only `TextFrame.TextRange.Font` is written, never the
+  shape outline or fill. Dry-run returns `font_before` and the `planned` change
+  (a `mixed` value means the text already has mixed formatting); the run reads
+  the font back and returns `verified`. Colors are `RRGGBB` like `set-format`.
 - Check the autofit before appending a paragraph to an existing placeholder: one
   set to shrink text on overflow shrinks *every* line in that placeholder. Put the
   addition in its own text box in a free band instead; `powerpoint slides read`
@@ -392,8 +485,8 @@ office --target t-PPTYYY com set 'document.Slides(3).Shapes(2).TextFrame.TextRan
 
 ## General operations (office com)
 
-For everything the curated commands do not cover — inserting or deleting rows,
-columns, or content, adding or editing shapes, tables, and images, page setup,
+For everything the curated commands do not cover — adding or editing shapes,
+tables, and images, page setup,
 running macros, and any other Word/Excel/PowerPoint operation — use the general
 object-model commands. They read any property, call any method, and set any
 property on the attached document. Only saving and closing are blocked.
@@ -455,10 +548,9 @@ can.
 
 Moving whole rows:
 
-There is no curated move-row command, so a row move is a short choreography of
-`com` calls. Describe the whole move as one change when asking for approval.
-Dry-run the first step to validate the sheet reference and row addresses, then
-run the steps in order (each write needs `--yes` and `--expected-document`):
+Row moves are curated: use `office excel rows move` (see "Excel row and column
+structure"). The raw choreography below is only a fallback for sheets the
+curated command rejects, and every step still follows the write workflow:
 
 ```text
 office com call 'document.Sheets(2).Rows(61).Copy()' --yes --expected-document "MovieLog.xlsx"

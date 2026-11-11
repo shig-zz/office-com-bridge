@@ -308,6 +308,112 @@ def test_word_insert_requires_text(monkeypatch) -> None:
     assert params["dry_run"] is True
 
 
+def test_word_paragraphs_read_inspects(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app, ["word", "paragraphs", "read", "--start", "10", "--count", "5"]
+    )
+    assert result.exit_code == 0
+    assert captured == {"kind": "word.paragraphs", "params": {"start": 10, "count": 5}}
+
+
+def test_word_find_passes_options(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app,
+        ["word", "find", "予算", "--match-case", "--whole-words", "--max", "5"],
+    )
+    assert result.exit_code == 0
+    assert captured == {
+        "kind": "word.find",
+        "params": {
+            "find": "予算",
+            "max": 5,
+            "match_case": True,
+            "whole_words": True,
+        },
+    }
+
+
+def test_word_replace_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "word",
+            "replace",
+            "旧称",
+            "--replace-with",
+            "新称",
+            "--nth",
+            "3",
+            "--yes",
+            "--expected-document",
+            "Report.docx",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "word.replace"
+    assert params == {
+        "find": "旧称",
+        "replace": "新称",
+        "dry_run": False,
+        "nth": 3,
+        "expected_document": "Report.docx",
+        "confirm": True,
+    }
+
+
+def test_word_replace_dry_run_does_not_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["word", "replace", "旧称", "--replace-with", "新称", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "word.replace"
+    assert params == {"find": "旧称", "replace": "新称", "dry_run": True}
+
+
+def test_word_paragraph_replace_sends_text(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["word", "paragraph", "replace", "12", "--text", "新しい本文", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "word.paragraph.replace_text"
+    assert params == {
+        "paragraph": 12,
+        "text": "新しい本文",
+        "dry_run": False,
+        "confirm": True,
+    }
+
+
 def test_com_get_passes_payload(monkeypatch) -> None:
     client = FakeClient()
     install_client(monkeypatch, client)
@@ -566,6 +672,165 @@ def test_powerpoint_slide_add_appends_without_index(monkeypatch) -> None:
     _, params = client.invocations[0]
     assert "index" not in params
     assert params["dry_run"] is True
+
+
+def test_powerpoint_slide_move_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "slide", "move", "72", "--to", "3", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.slide.move"
+    assert params == {"slide": 72, "to": 3, "dry_run": False, "confirm": True}
+
+
+def test_powerpoint_shape_delete_numeric_shape_becomes_int(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "shape", "delete", "5", "--shape", "2", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.shape.delete"
+    assert params["shape"] == 2
+    assert params["confirm"] is True
+
+
+def test_powerpoint_shape_set_format_passes_options(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint",
+            "shape",
+            "set-format",
+            "5",
+            "--shape",
+            "TextBox 3",
+            "--font-size",
+            "14",
+            "--color",
+            "FF8000",
+            "--bold",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.shape.set_format"
+    assert params == {
+        "slide": 5,
+        "shape": "TextBox 3",
+        "dry_run": False,
+        "font_size": 14.0,
+        "color": "FF8000",
+        "bold": True,
+        "confirm": True,
+    }
+
+
+def test_excel_rows_insert_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["excel", "rows", "insert", "2:4", "--yes", "--expected-document", "Book1.xlsx"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.rows.insert"
+    assert params == {
+        "row": "2:4",
+        "dry_run": False,
+        "expected_document": "Book1.xlsx",
+        "confirm": True,
+    }
+
+
+def test_excel_rows_delete_dry_run_does_not_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["excel", "rows", "delete", "61", "--dry-run"])
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.rows.delete"
+    assert params == {"row": "61", "dry_run": True}
+
+
+def test_excel_rows_move_sends_row_and_to(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["excel", "rows", "move", "61", "--to", "60", "--sheet", "記録", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.rows.move"
+    assert params == {
+        "row": 61,
+        "to": 60,
+        "dry_run": False,
+        "sheet": "記録",
+        "confirm": True,
+    }
+
+
+def test_excel_columns_delete_with_shift(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["excel", "columns", "delete", "A:C", "--shift", "left", "--yes"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.columns.delete"
+    assert params == {
+        "column": "A:C",
+        "dry_run": False,
+        "shift": "left",
+        "confirm": True,
+    }
+
+
+def test_excel_range_read_format_inspects(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app, ["excel", "range", "read-format", "A1:B2", "--borders"]
+    )
+    assert result.exit_code == 0
+    assert captured == {
+        "kind": "excel.range.format",
+        "params": {"address": "A1:B2", "borders": True},
+    }
+
+
+def test_excel_copy_format_borders_flag(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["excel", "range", "copy-format", "A1:B2", "C1:D2", "--borders", "--yes"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.copy_format"
+    assert params["borders"] is True
+    assert params["confirm"] is True
 
 
 def test_powerpoint_notes_read_passes_slide(monkeypatch) -> None:

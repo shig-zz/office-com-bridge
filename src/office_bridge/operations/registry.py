@@ -52,6 +52,16 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             max_cells=settings.max_cells,
         )
 
+    if kind == "excel.range.format":
+        _require_app(target, AppKind.EXCEL, kind)
+        address = require_str(params, "address")
+        return excel.read_format(
+            target,
+            address=address,
+            max_cells=settings.max_cells,
+            include_borders=optional_bool(params, "borders", False),
+        )
+
     if kind in {"excel.workbook", "word.document", "powerpoint.document"}:
         if kind == "excel.workbook":
             _require_app(target, AppKind.EXCEL, kind)
@@ -61,6 +71,26 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             return word.document(target)
         _require_app(target, AppKind.POWERPOINT, kind)
         return powerpoint.document(target, max_text_chars=settings.max_text_chars)
+
+    if kind == "word.paragraphs":
+        _require_app(target, AppKind.WORD, kind)
+        return word.paragraphs(
+            target,
+            start=params.get("start", 1),
+            count=params.get("count", 50),
+            max_text_chars=settings.max_text_chars,
+        )
+
+    if kind == "word.find":
+        _require_app(target, AppKind.WORD, kind)
+        return word.find(
+            target,
+            find_text=params.get("find"),
+            match_case=optional_bool(params, "match_case", False),
+            whole_words=optional_bool(params, "whole_words", False),
+            max_matches=int(params.get("max", 50) or 50),
+            max_text_chars=settings.max_text_chars,
+        )
 
     if kind == "powerpoint.slides":
         _require_app(target, AppKind.POWERPOINT, kind)
@@ -151,6 +181,7 @@ def _invoke(
             dry_run=dry_run,
             max_cells=settings.max_cells,
             params=params,
+            include_borders=optional_bool(params, "borders", False),
         )
 
     if operation == "excel.range.set_format":
@@ -189,6 +220,68 @@ def _invoke(
             keys=params.get("keys"),
             dry_run=dry_run,
             max_cells=settings.max_cells,
+            params=params,
+        )
+
+    if operation in {
+        "excel.rows.insert",
+        "excel.rows.delete",
+        "excel.columns.insert",
+        "excel.columns.delete",
+    }:
+        _require_app(target, AppKind.EXCEL, operation)
+        dimension, _, mode = operation.split(".")[1:]
+        spec_key = "row" if dimension == "rows" else "column"
+        if spec_key not in params:
+            raise invalid_request(f"Parameter {spec_key!r} is required.")
+        dry_run = optional_bool(params, "dry_run", False)
+        return excel.insert_or_delete(
+            target,
+            dimension=dimension,
+            spec=params.get(spec_key),
+            shift=params.get("shift"),
+            mode=mode,
+            dry_run=dry_run,
+            params=params,
+        )
+
+    if operation == "excel.rows.move":
+        _require_app(target, AppKind.EXCEL, operation)
+        if "row" not in params or "to" not in params:
+            raise invalid_request("Parameters 'row' and 'to' are required.")
+        dry_run = optional_bool(params, "dry_run", False)
+        return excel.move_rows(
+            target,
+            row=params.get("row"),
+            to=params.get("to"),
+            sheet_name=params.get("sheet"),
+            dry_run=dry_run,
+            params=params,
+        )
+
+    if operation == "word.replace":
+        _require_app(target, AppKind.WORD, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return word.replace(
+            target,
+            find_text=params.get("find"),
+            replacement=params.get("replace"),
+            match_case=optional_bool(params, "match_case", False),
+            whole_words=optional_bool(params, "whole_words", False),
+            nth=params.get("nth"),
+            dry_run=dry_run,
+            params=params,
+        )
+
+    if operation == "word.paragraph.replace_text":
+        _require_app(target, AppKind.WORD, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return word.replace_paragraph_text(
+            target,
+            paragraph=params.get("paragraph"),
+            text=params.get("text"),
+            dry_run=dry_run,
+            max_text_chars=settings.max_text_chars,
             params=params,
         )
 
@@ -256,6 +349,44 @@ def _invoke(
             params=params,
         )
 
+    if operation == "powerpoint.slide.move":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.slide_move(
+            target,
+            slide_index=params.get("slide"),
+            to_index=params.get("to"),
+            dry_run=dry_run,
+            params=params,
+        )
+
+    if operation == "powerpoint.shape.delete":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.shape_delete(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            dry_run=dry_run,
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
+    if operation == "powerpoint.shape.set_format":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.shape_set_format(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            font_size=params.get("font_size"),
+            font_name=params.get("font_name"),
+            color=params.get("color"),
+            bold=params.get("bold"),
+            dry_run=dry_run,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -314,6 +445,23 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 },
             },
             {
+                "name": "excel.range.format",
+                "applications": ["Excel"],
+                "mode": "read",
+                "description": (
+                    "Read cell formatting (fill, font, number format, alignment) "
+                    "cell by cell, with colors converted from Excel's BGR integers "
+                    "to RRGGBB hex. Pass borders: true to include per-side border "
+                    "style, weight and color. Multi-cell Interior.Color/Borders "
+                    "reads are unreliable on this build, so every cell is read "
+                    "individually; keep the range small."
+                ),
+                "params": {
+                    "address": {"type": "string", "required": True},
+                    "borders": {"type": "boolean", "required": False},
+                },
+            },
+            {
                 "name": "excel.workbook",
                 "applications": ["Excel"],
                 "mode": "read",
@@ -333,6 +481,35 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "mode": "read",
                 "description": "Read document metadata and basic counts.",
                 "params": {},
+            },
+            {
+                "name": "word.find",
+                "applications": ["Word"],
+                "mode": "read",
+                "description": (
+                    "Search the document body and report each match's paragraph "
+                    "number and a text snippet. Read-only (no confirmation). The "
+                    "match count reflects the bridge's own scan of paragraph text."
+                ),
+                "params": {
+                    "find": {"type": "string", "required": True},
+                    "match_case": {"type": "boolean", "required": False},
+                    "whole_words": {"type": "boolean", "required": False},
+                    "max": {"type": "number", "required": False, "note": "Maximum matches to report, default 50."},
+                },
+            },
+            {
+                "name": "word.paragraphs",
+                "applications": ["Word"],
+                "mode": "read",
+                "description": (
+                    "Read a window of paragraphs with their style name and heading "
+                    "flag. Up to 200 paragraphs per call."
+                ),
+                "params": {
+                    "start": {"type": "number", "required": False, "note": "1-based paragraph number, default 1."},
+                    "count": {"type": "number", "required": False, "note": "Paragraphs to read, default 50, max 200."},
+                },
             },
             {
                 "name": "powerpoint.slide",
@@ -403,14 +580,60 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 },
             },
             {
+                "name": "word.replace",
+                "applications": ["Word"],
+                "mode": "write",
+                "description": (
+                    "Replace occurrences of a literal string throughout the body "
+                    "using Word's own Find (formatting preserved; tracked when "
+                    "Track Changes is on). Dry-run reports the match count and the "
+                    "first paragraph before anything changes; the run re-scans and "
+                    "reports 'verified'. Pass nth to replace a single numbered "
+                    "match instead of all of them."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "find": {"type": "string", "required": True},
+                    "replace": {"type": "string", "required": True, "note": "Replacement text; empty string deletes the match."},
+                    "match_case": {"type": "boolean", "required": False},
+                    "whole_words": {"type": "boolean", "required": False},
+                    "nth": {"type": "number", "required": False, "note": "1-based match number to replace only this one; omit to replace all."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "word.paragraph.replace_text",
+                "applications": ["Word"],
+                "mode": "write",
+                "description": (
+                    "Replace one paragraph's body text by 1-based number, keeping "
+                    "the paragraph break. Dry-run previews the current text and the "
+                    "paragraph count before/after (newlines split paragraphs); the "
+                    "run reads the paragraph back and reports 'verified'. Editing a "
+                    "paragraph inside a table or field is unreliable: prefer "
+                    "word.replace for in-place edits."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "paragraph": {"type": "number", "required": True, "note": "1-based paragraph number."},
+                    "text": {"type": "string", "required": True},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
                 "name": "excel.range.copy_format",
                 "applications": ["Excel"],
                 "mode": "write",
-                "description": "Copy formatting only (font, fill, borders, number format, alignment) from a source range to a target range of the same size. Cell values are not changed.",
+                "description": "Copy formatting only (font, fill, borders, number format, alignment) from a source range to a target range of the same size. Cell values are not changed. This build does not propagate cell borders through a format paste: pass borders=true and the operation re-applies them cell by cell (reported as borders_applied).",
                 "requires_confirmation": True,
                 "params": {
                     "source_address": {"type": "string", "required": True},
                     "address": {"type": "string", "required": True},
+                    "borders": {"type": "boolean", "required": False},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},
@@ -473,6 +696,103 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                             "an optional 'order' ('ascending' default or 'descending')."
                         ),
                     },
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.rows.insert",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Insert whole rows on the active sheet at a row number or the "
+                    "first row of a \"first:last\" range (\"61\" or \"2:4\"). The "
+                    "shift enum is applied for you (down by default) and the used "
+                    "range is re-read afterwards to report 'verified'."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "row": {"type": "number or string", "required": True, "note": "1-based row number or \"first:last\" range."},
+                    "shift": {"type": "string", "required": False, "note": "down (default) or right."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.rows.delete",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Delete whole rows on the active sheet by row number or "
+                    "\"first:last\" range. Range-limited deletes stay unavailable: "
+                    "only whole rows are deleted. The used range is re-read to "
+                    "report 'verified', and the result carries an undo hint."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "row": {"type": "number or string", "required": True, "note": "1-based row number or \"first:last\" range."},
+                    "shift": {"type": "string", "required": False, "note": "omit for the reliable no-shift call; up or left to force a shift."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.columns.insert",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Insert whole columns on the active sheet at a column letter, "
+                    "a 1-based index, or an \"A:C\" range (\"C\", \"3\", or \"A:C\"). "
+                    "The shift enum is applied for you (right by default)."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "column": {"type": "string or number", "required": True, "note": "Column letter, 1-based index, or \"first:last\" range."},
+                    "shift": {"type": "string", "required": False, "note": "right (default) or down."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.columns.delete",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Delete whole columns on the active sheet by letter, 1-based "
+                    "index, or \"A:C\" range. The used range is re-read to report "
+                    "'verified', and the result carries an undo hint."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "column": {"type": "string or number", "required": True, "note": "Column letter, 1-based index, or \"first:last\" range."},
+                    "shift": {"type": "string", "required": False, "note": "omit for the reliable no-shift call; up or left to force a shift."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "excel.rows.move",
+                "applications": ["Excel"],
+                "mode": "write",
+                "description": (
+                    "Move one whole row to a new position with the proven copy/"
+                    "insert/clear/delete choreography: values, formatting and "
+                    "hyperlinks travel with the row. Reports completed_steps, and "
+                    "a mid-move failure returns RANGE_INVALID with the steps done "
+                    "so the sheet can be re-read before cleanup; one undo would "
+                    "only revert the last step. Uses the clipboard, so no other "
+                    "clipboard work may run concurrently."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "row": {"type": "number", "required": True, "note": "1-based row to move."},
+                    "to": {"type": "number", "required": True, "note": "1-based destination row; the row lands exactly at this number."},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; default is the active sheet."},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},
@@ -598,6 +918,70 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "requires_confirmation": True,
                 "params": {
                     "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.slide.move",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Move one slide to a new 1-based position (Slides(n).MoveTo). "
+                    "Dry-run reports the direction and the slide title; the run "
+                    "verifies the SlideID lands at the requested index. Typical "
+                    "use: gathering correction-note slides at the end of a deck."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "to": {"type": "number", "required": True, "note": "1-based destination position."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.shape.delete",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Delete one shape by 1-based index or name. Dry-run reports "
+                    "the shape name, type and a text preview so the exact shape "
+                    "can be confirmed with the user; the run verifies the shape "
+                    "count dropped by one and returns an undo hint."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number or string", "required": True, "note": "1-based shape index or shape name."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.shape.set_format",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Set text font properties (font_size, font_name, RRGGBB "
+                    "color, bold) on the text of one shape. Only "
+                    "TextFrame.TextRange.Font is written; the shape outline and "
+                    "fill are left alone. Dry-run returns the current values and "
+                    "the planned change; the run reads the font back and reports "
+                    "'verified'. Mixed values across the text read back as "
+                    "'mixed' in font_before."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number or string", "required": True, "note": "1-based shape index or shape name."},
+                    "font_size": {"type": "number", "required": False, "note": "Point size 1-400."},
+                    "font_name": {"type": "string", "required": False},
+                    "color": {"type": "string", "required": False, "note": "RRGGBB hex; converted to Office's BGR integer."},
+                    "bold": {"type": "boolean", "required": False},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},

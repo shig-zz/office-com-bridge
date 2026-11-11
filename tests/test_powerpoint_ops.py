@@ -21,7 +21,10 @@ class _Caller:
 
 class FakeFont:
     def __init__(self) -> None:
+        self.Name = "Calibri"
         self.Size = 18.0
+        self.Bold = 0
+        self.Color = SimpleNamespace(RGB=0)
 
 
 class FakeTextRange:
@@ -64,6 +67,11 @@ class FakeShape:
         self.HasTextFrame = True
         self.TextFrame = FakeTextFrame(text)
         self.HasTable = False
+        self._shapes_container = None
+
+    def Delete(self) -> None:
+        if self._shapes_container is not None:
+            self._shapes_container.remove_shape(self)
 
 
 class FakeShapes:
@@ -72,6 +80,8 @@ class FakeShapes:
         self.Count = len(shapes)
         self.Title = title
         self.added: list[tuple] = []
+        for shape in shapes:
+            shape._shapes_container = self  # noqa: SLF001
 
     def __call__(self, ref) -> FakeShape:
         if isinstance(ref, str):
@@ -95,7 +105,12 @@ class FakeShapes:
         )
         self._shapes.append(shape)
         self.Count = len(self._shapes)
+        shape._shapes_container = self  # noqa: SLF001
         return shape
+
+    def remove_shape(self, shape: FakeShape) -> None:
+        self._shapes.remove(shape)
+        self.Count = len(self._shapes)
 
 
 class FakeSlide:
@@ -118,6 +133,10 @@ class FakeSlide:
         if self._container is not None:
             self._container.remove_slide(self)
 
+    def MoveTo(self, to: int) -> None:
+        if self._container is not None:
+            self._container.move_slide(self, to)
+
 
 class FakeSlides:
     def __init__(self, slides: list[FakeSlide]) -> None:
@@ -139,6 +158,12 @@ class FakeSlides:
     def remove_slide(self, slide: FakeSlide) -> None:
         self._slides.remove(slide)
         self.Count = len(self._slides)
+
+    def move_slide(self, slide: FakeSlide, to: int) -> None:
+        self._slides.remove(slide)
+        self._slides.insert(to - 1, slide)
+        for position, item in enumerate(self._slides, start=1):
+            item.SlideIndex = position
 
 
 class FakePresentation:
@@ -486,3 +511,189 @@ def test_slide_delete_requires_confirmation() -> None:
     with pytest.raises(BridgeError) as excinfo:
         powerpoint.slide_delete(target, slide_index=1, dry_run=False, params={})
     assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+
+
+def test_slide_delete_result_carries_undo_hint() -> None:
+    target = make_target([FakeSlide(1, "Keep", ""), FakeSlide(2, "Drop", "")])
+    result = powerpoint.slide_delete(target, slide_index=2, dry_run=False, params={"confirm": True})
+    assert "undo" in result["undo_hint"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3C: slide move, shape delete, shape set-format
+
+
+def test_slide_move_dry_run_reports_plan() -> None:
+    target = make_target(
+        [FakeSlide(1, "First", ""), FakeSlide(2, "Second", ""), FakeSlide(3, "Note", "")]
+    )
+    result = powerpoint.slide_move(target, slide_index=3, to_index=1, dry_run=True, params={})
+    assert result["direction"] == "up"
+    assert result["slide_title"] == "Note"
+    assert result["moved"] is False
+    assert target.document.Slides(1).SlideID == 201
+
+
+def test_slide_move_down_applies_and_verifies() -> None:
+    target = make_target(
+        [FakeSlide(1, "First", ""), FakeSlide(2, "Second", ""), FakeSlide(3, "Note", "")]
+    )
+    result = powerpoint.slide_move(target, slide_index=1, to_index=3, dry_run=False, params={"confirm": True})
+    assert result["moved"] is True
+    assert result["verified"] is True
+    moved = target.document.Slides(3)
+    assert moved.SlideID == 201
+    assert moved.SlideIndex == 3
+    assert result["slide_title_after"] == "First"
+
+
+def test_slide_move_up_applies_and_verifies() -> None:
+    target = make_target(
+        [FakeSlide(1, "First", ""), FakeSlide(2, "Second", ""), FakeSlide(3, "Note", "")]
+    )
+    result = powerpoint.slide_move(target, slide_index=3, to_index=1, dry_run=False, params={"confirm": True})
+    assert result["verified"] is True
+    assert target.document.Slides(1).SlideID == 203
+    assert target.document.Slides(2).SlideID == 201
+
+
+def test_slide_move_requires_confirmation() -> None:
+    target = make_target([FakeSlide(1, "One", ""), FakeSlide(2, "Two", "")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.slide_move(target, slide_index=1, to_index=2, dry_run=False, params={})
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert target.document.Slides(1).SlideID == 201
+
+
+def test_slide_move_rejects_bad_targets() -> None:
+    target = make_target([FakeSlide(1, "One", ""), FakeSlide(2, "Two", "")])
+    for bad_to in (0, 3, 1, "2"):
+        with pytest.raises(BridgeError) as excinfo:
+            powerpoint.slide_move(target, slide_index=1, to_index=bad_to, dry_run=True, params={})
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_shape_delete_dry_run_reports_preview() -> None:
+    target = make_target([FakeSlide(1, "Title", "drop me")])
+    result = powerpoint.shape_delete(
+        target, slide_index=1, shape_ref=2, dry_run=True, max_text_chars=100, params={}
+    )
+    assert result["shape_name"] == "Body"
+    assert result["text_preview"] == "drop me"
+    assert result["shape_count_before"] == 2
+    assert result["deleted"] is False
+    assert target.document.Slides(1).Shapes.Count == 2
+
+
+def test_shape_delete_removes_and_verifies() -> None:
+    target = make_target([FakeSlide(1, "Title", "drop me")])
+    result = powerpoint.shape_delete(
+        target, slide_index=1, shape_ref="Body", dry_run=False, max_text_chars=100, params={"confirm": True}
+    )
+    assert result["deleted"] is True
+    assert result["verified"] is True
+    assert result["shape_count_after"] == 1
+    assert "undo" in result["undo_hint"]
+
+
+def test_shape_delete_requires_confirmation() -> None:
+    target = make_target([FakeSlide(1, "Title", "body")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.shape_delete(
+            target, slide_index=1, shape_ref=2, dry_run=False, max_text_chars=100, params={}
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+    assert target.document.Slides(1).Shapes.Count == 2
+
+
+def test_shape_set_format_dry_run_previews_current_font() -> None:
+    target = make_target([FakeSlide(1, "Title", "body text")])
+    result = powerpoint.shape_set_format(
+        target,
+        slide_index=1,
+        shape_ref=2,
+        font_size=14,
+        font_name=None,
+        color="FF8000",
+        bold=True,
+        dry_run=True,
+        params={},
+    )
+    assert result["apply_to"] == "text_range"
+    assert result["font_before"] == {
+        "name": "Calibri",
+        "size": 18.0,
+        "bold": False,
+        "color": "000000",
+    }
+    assert result["planned"] == {"font_size": 14.0, "color": "FF8000", "bold": True}
+    assert result["changed"] is False
+    assert target.document.Slides(1).Shapes(2).TextFrame.TextRange.Font.Size == 18.0
+
+
+def test_shape_set_format_applies_and_verifies() -> None:
+    target = make_target([FakeSlide(1, "Title", "body text")])
+    result = powerpoint.shape_set_format(
+        target,
+        slide_index=1,
+        shape_ref=2,
+        font_size=14,
+        font_name="Meiryo",
+        color="FF8000",
+        bold=False,
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert result["changed"] is True
+    assert result["verified"] is True
+    font = target.document.Slides(1).Shapes(2).TextFrame.TextRange.Font
+    assert font.Size == 14.0
+    assert font.Name == "Meiryo"
+    assert font.Bold == 0
+    # FF8000 is stored as the BGR integer Office uses
+    assert font.Color.RGB == 0x0080FF
+    assert result["font_after"]["color"] == "FF8000"
+
+
+def test_shape_set_format_requires_confirmation() -> None:
+    target = make_target([FakeSlide(1, "Title", "body text")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.shape_set_format(
+            target, slide_index=1, shape_ref=2, font_size=12, font_name=None, color=None, bold=None,
+            dry_run=False, params={},
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+
+
+def test_shape_set_format_rejects_bad_parameters() -> None:
+    target = make_target([FakeSlide(1, "Title", "body text")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.shape_set_format(
+            target, slide_index=1, shape_ref=2, font_size=None, font_name=None, color=None, bold=None,
+            dry_run=True, params={},
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    for bad_color in ("red", "GGGGGG", 5):
+        with pytest.raises(BridgeError) as excinfo:
+            powerpoint.shape_set_format(
+                target, slide_index=1, shape_ref=2, font_size=None, font_name=None,
+                color=bad_color, bold=None, dry_run=True, params={},
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    for bad_size in (0, 500, "12"):
+        with pytest.raises(BridgeError) as excinfo:
+            powerpoint.shape_set_format(
+                target, slide_index=1, shape_ref=2, font_size=bad_size, font_name=None,
+                color=None, bold=None, dry_run=True, params={},
+            )
+        assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_shape_set_format_refuses_shape_without_text() -> None:
+    target = make_target([FakeSlide(1, "Title", "")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.shape_set_format(
+            target, slide_index=1, shape_ref=2, font_size=12, font_name=None, color=None, bold=None,
+            dry_run=True, params={},
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
