@@ -1,7 +1,7 @@
 # Phase 3 計画：Excel 構造操作・Word 編集系・PowerPoint 補完（三アプリ横断）
 
 作成日: 2026-11-11
-**状態: 3A・3B・3C とも実装完了（2026-11-12）。pytest 369 件全緑、capabilities・CLI・SKILL.md・README 日英 更新済み。実文書スモークのみ未実施（ブリッジ再起動とユーザーのホットキー登録が必要）。**
+**状態: 3A・3B・3C 実装完了＋実文書スモーク完了（2026-11-12）。pytest 371 件全緑。PowerPoint で slide move / shape delete / shape set-format の dry-run、Excel で read-format・rows/columns dry-run・rows insert→delete の実書き込み往復（verified 2件）を確認。スモーク中に判明した registry の操作名分解バグと UsedRange 検証ヒューリスティックの不整合を修正済み（jj 13944bf9, e450ff66）。Word スモークのみ Word 起動時に延期。**
 
 起点: Phase 2 までの実運用（PowerPoint 校訂 33 書き込み、Excel 行移動・罫線・塗りつぶし作業、複数文書比較）と、SKILL.md に固定した「この Office ビルドの挙動」から、キュレーション欠如・手組み回避が残っている領域を抽出した。対象は Word / Excel / PowerPoint の三アプリ。
 
