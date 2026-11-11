@@ -1031,7 +1031,14 @@ def insert_or_delete(
     if last_before is None or last_after is None:
         verified: bool | None = None
     elif mode == "insert":
-        expected = last_before + (count if first <= last_before else 0)
+        if first <= last_before:
+            # Inserting inside the used area pushes the end down by count.
+            expected = last_before + count
+        else:
+            # Inserting below the used area extends the used range to the
+            # inserted rows themselves (blank inserted rows still count as
+            # used on this build).
+            expected = max(last_before, first + count - 1)
         verified = last_after == expected
     else:
         removed = 0 if first > last_before else min(count, last_before - first + 1)

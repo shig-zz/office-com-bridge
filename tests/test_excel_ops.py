@@ -1152,6 +1152,26 @@ def test_rows_insert_dry_run_and_apply() -> None:
     assert len(sheet.grid) == 10
 
 
+def test_rows_insert_below_used_range_still_verifies() -> None:
+    # Inserting just below the used area extends the used range to the
+    # inserted rows themselves; the verification must expect that instead of
+    # flagging the growth as unverified (found in the live Excel smoke).
+    sheet = make_sort_sheet()
+    target = make_sort_target(sheet)
+    result = excel.insert_or_delete(
+        target,
+        dimension="rows",
+        spec="8:9",
+        shift=None,
+        mode="insert",
+        dry_run=False,
+        params={"confirm": True},
+    )
+    assert result["first"] == 8
+    assert result["last_used_after"] == 9
+    assert result["verified"] is True
+
+
 def test_rows_insert_requires_confirmation() -> None:
     sheet = make_sort_sheet()
     target = make_sort_target(sheet)
