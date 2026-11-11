@@ -5,13 +5,14 @@ from typing import Any
 from ..config import Settings
 from ..errors import invalid_request, unsupported_application, unsupported_operation
 from ..target import AppKind, ResolvedTarget
-from . import com_ops, excel, powerpoint, word
+from . import com_ops, excel, powerpoint, undo, word
 from .com_ops import MODES, ROOTS
 from .common import (
     document_result,
     optional_bool,
     require_str,
     selection_result,
+    unsaved_changes,
 )
 
 
@@ -70,6 +71,14 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             max_text_chars=settings.max_text_chars,
         )
 
+    if kind == "powerpoint.notes":
+        _require_app(target, AppKind.POWERPOINT, kind)
+        return powerpoint.notes(
+            target,
+            slide_index=params.get("slide"),
+            max_text_chars=settings.max_text_chars,
+        )
+
     raise unsupported_operation(kind)
 
 
@@ -79,6 +88,27 @@ def invoke(
     params: dict[str, Any],
     settings: Settings,
 ) -> dict[str, Any]:
+    result = _invoke(target, operation, params, settings)
+    # Applied writes report whether the document now holds unsaved changes so
+    # agents can tell the user to save in Office without being asked.
+    if isinstance(result, dict) and not optional_bool(params, "dry_run", False):
+        result.setdefault("unsaved_changes", unsaved_changes(target))
+    return result
+
+
+def _invoke(
+    target: ResolvedTarget,
+    operation: str,
+    params: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    if operation == "undo":
+        return undo.undo(
+            target,
+            dry_run=optional_bool(params, "dry_run", False),
+            params=params,
+        )
+
     if operation == "excel.range.write":
         _require_app(target, AppKind.EXCEL, operation)
         address = require_str(params, "address")
@@ -204,6 +234,28 @@ def invoke(
             params=params,
         )
 
+    if operation == "powerpoint.notes.set":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.notes_set(
+            target,
+            slide_index=params.get("slide"),
+            text=params.get("text"),
+            dry_run=dry_run,
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
+    if operation == "powerpoint.slide.delete":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        dry_run = optional_bool(params, "dry_run", False)
+        return powerpoint.slide_delete(
+            target,
+            slide_index=params.get("slide"),
+            dry_run=dry_run,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -216,7 +268,10 @@ def set_property(
 ) -> dict[str, Any]:
     if name == "excel.active_sheet":
         _require_app(target, AppKind.EXCEL, name)
-        return excel.set_active_sheet(target, value, params)
+        result = excel.set_active_sheet(target, value, params)
+        if isinstance(result, dict):
+            result.setdefault("unsaved_changes", unsaved_changes(target))
+        return result
     raise unsupported_operation(name)
 
 
@@ -306,6 +361,15 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "start": {"type": "number", "required": False, "note": "1-based slide number, default 1."},
                     "count": {"type": "number", "required": False, "note": "Slides to read, default 20, max 100."},
+                },
+            },
+            {
+                "name": "powerpoint.notes",
+                "applications": ["PowerPoint"],
+                "mode": "read",
+                "description": "Read the speaker notes of one slide.",
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
                 },
             },
         ],
@@ -503,6 +567,59 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                     "confirm": {"type": "boolean", "required": True},
                 },
             },
+            {
+                "name": "powerpoint.notes.set",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Replace the speaker notes of one slide. Dry-run previews the "
+                    "current notes; the run reads them back and returns 'verified'."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "text": {"type": "string", "required": True, "note": "New notes text (empty string clears)."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.slide.delete",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Delete one slide by 1-based number. Dry-run reports the title "
+                    "of the slide that would be removed; the run verifies the "
+                    "slide count dropped by one. This cannot be undone through "
+                    "the bridge: ask the user to confirm the exact slide."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "undo",
+                "applications": ["Excel", "Word", "PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Undo the most recent Office action (application.Undo). "
+                    "Dry-run reports whether anything is undoable "
+                    "(application.Undoable). Undoing reverts the user's own "
+                    "actions too, so confirm the exact action with the user "
+                    "before running."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
         ],
         "properties": [
             {
@@ -520,11 +637,14 @@ def capabilities(settings: Settings) -> dict[str, Any]:
         ],
         "com": {
             "endpoint": "POST /com",
+            "batch_endpoint": "POST /com/batch",
             "description": (
                 "General Office object-model access. Reads any property, calls any "
                 "method, and sets any property on the attached document. Use it for "
                 "anything the curated commands above do not cover; save and close "
-                "operations are blocked (see security.blocked_calls)."
+                "operations are blocked (see security.blocked_calls). The batch "
+                "endpoint runs an array of steps in one request with one "
+                "confirmation, stopping at the first failing step."
             ),
             "modes": [
                 {

@@ -36,6 +36,9 @@ class FakeClient:
         self.invocations: list[tuple[str, dict[str, Any]]] = []
         self.set_calls: list[tuple[str, Any, bool, Any]] = []
         self.com_calls: list[tuple[str, str, str, Any, bool, bool, Any]] = []
+        self.batch_calls: list[tuple[list[dict[str, Any]], bool, Any]] = []
+        self.prune_calls: list[bool] = []
+        self.reconnect_calls: list[str] = []
         self.capture_calls: list[Any] = []
         self.info_calls: list[str] = []
         self.remove_calls: list[str] = []
@@ -64,6 +67,18 @@ class FakeClient:
     def com(self, mode, root, expression, value, dry_run, confirm, expected_document):
         self.com_calls.append((mode, root, expression, value, dry_run, confirm, expected_document))
         return {"ok": True, "result": {"mode": mode}}
+
+    def com_batch(self, steps, confirm, expected_document):
+        self.batch_calls.append((steps, confirm, expected_document))
+        return {"ok": True, "result": {"steps": [{"step": i, "ok": True} for i in range(len(steps))], "stopped": False}}
+
+    def prune_targets(self):
+        self.prune_calls.append(True)
+        return {"ok": True, "result": {"removed": ["t-expired00000"], "count": 1}}
+
+    def reconnect_target(self, target_id):
+        self.reconnect_calls.append(target_id)
+        return {"ok": True, "result": {"target": {"target_id": target_id, "state": "active"}, "reconnected": True}}
 
     def capture(self, hwnd=None):
         self.capture_calls.append(hwnd)
@@ -551,6 +566,160 @@ def test_powerpoint_slide_add_appends_without_index(monkeypatch) -> None:
     _, params = client.invocations[0]
     assert "index" not in params
     assert params["dry_run"] is True
+
+
+def test_powerpoint_notes_read_passes_slide(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(cli.app, ["powerpoint", "notes", "read", "70"])
+    assert result.exit_code == 0
+    assert captured == {"kind": "powerpoint.notes", "params": {"slide": 70}}
+
+
+def test_powerpoint_notes_set_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "notes", "set", "70", "--text", "校訂ノート", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.notes.set"
+    assert params == {"slide": 70, "text": "校訂ノート", "dry_run": False, "confirm": True}
+
+
+def test_powerpoint_notes_set_text_from_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "notes.txt"
+    path.write_text("一行目\n二行目", encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "notes", "set", "70", "--text", f"@{path}", "--yes"],
+    )
+    assert result.exit_code == 0
+    assert client.invocations[0][1]["text"] == "一行目\n二行目"
+
+
+def test_powerpoint_slide_delete_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "slide", "delete", "3", "--yes"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.slide.delete"
+    assert params == {"slide": 3, "dry_run": False, "confirm": True}
+
+
+def test_undo_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["undo", "--yes", "--expected-document", "Deck.pptx"]
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "undo"
+    assert params == {"dry_run": False, "confirm": True, "expected_document": "Deck.pptx"}
+
+
+def test_undo_dry_run_does_not_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["undo", "--dry-run"])
+    assert result.exit_code == 0
+    _, params = client.invocations[0]
+    assert params == {"dry_run": True}
+
+
+def test_target_prune_and_reconnect(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["target", "prune"])
+    assert result.exit_code == 0
+    assert client.prune_calls == [True]
+
+    result = CliRunner().invoke(cli.app, ["target", "reconnect", "t-aaaa1111aaaa"])
+    assert result.exit_code == 0
+    assert client.reconnect_calls == ["t-aaaa1111aaaa"]
+
+
+def test_com_batch_file_sends_steps(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "steps.json"
+    path.write_text(
+        '[{"mode": "get", "expression": "document.Name"},'
+        ' {"mode": "set", "root": "document", "expression": "ReadOnly", "value": false}]',
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        cli.app, ["com", "batch", "--file", str(path), "--yes"]
+    )
+    assert result.exit_code == 0
+    steps, confirm, expected = client.batch_calls[0]
+    assert confirm is True
+    assert expected is None
+    assert steps[0] == {
+        "mode": "get",
+        "root": "window",
+        "expression": "document.Name",
+        "value": None,
+        "dry_run": False,
+    }
+    assert steps[1]["mode"] == "set"
+    assert steps[1]["value"] is False
+
+
+def test_com_batch_get_only_needs_no_confirm(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "steps.json"
+    path.write_text(
+        '[{"mode": "get", "expression": "document.Name"},'
+        ' {"mode": "get", "expression": "Slides.Count"}]',
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(cli.app, ["com", "batch", "--file", str(path)])
+    assert result.exit_code == 0
+    steps, confirm, _expected = client.batch_calls[0]
+    assert confirm is False
+    assert steps[0]["dry_run"] is False
+
+
+def test_com_batch_dry_run_marks_every_step(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "steps.json"
+    path.write_text('[{"mode": "call", "expression": "Rows(2).Delete()"}]', encoding="utf-8")
+    result = CliRunner().invoke(
+        cli.app, ["com", "batch", "--file", str(path), "--dry-run"]
+    )
+    assert result.exit_code == 0
+    steps, confirm, _expected = client.batch_calls[0]
+    assert confirm is False
+    assert steps[0]["dry_run"] is True
+
+
+def test_com_batch_rejects_bad_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "steps.json"
+    path.write_text("not json", encoding="utf-8")
+    result = CliRunner().invoke(cli.app, ["com", "batch", "--file", str(path), "--yes"])
+    assert result.exit_code != 0
+    assert client.batch_calls == []
 
 
 def test_load_values_accepts_values_object() -> None:

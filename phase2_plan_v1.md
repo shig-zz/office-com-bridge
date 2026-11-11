@@ -1,7 +1,7 @@
 # Phase 2 計画：COM エラー体験の改善と PowerPoint 書込系の追加
 
 作成日: 2026-11-11
-**状態: 2A・2B 実装完了（2026-11-11）。pytest 269件全緑。実文書でのスモークテスト済み（slides read / text replace / textbox add / slide add のdry-run、`did_you_mean`、`--value @file`）。Phase 2C は未着手。**
+**状態: 2A・2B・2C 実装完了（2026-11-11）。pytest 全緑。2A/2B は実文書スモーク済み（slides read / text replace / textbox add / slide add のdry-run、`did_you_mean`、`--value @file`）。2C の実文書スモークはブリッジ再起動とターゲット再取得後に実施。**
 
 起点: 20210416_3次元グラフィックスの基礎知識.pptx のファクトチェック／校訂作業（読み取り69枚、書き込み約33回、失敗2回、検証読み戻し約30回）で観測した実運用上の摩擦。
 
@@ -66,14 +66,15 @@
 - `Slides.Add(index, layout)`。実行後は新スライドの index と placeholder（`Shapes` の index/name）を返す。
 - Excel のシート配置引数解決（com_ops）は PowerPoint 側では作用しないことをテストで固定する。
 
-## Phase 2C：今回やらない（次フェーズ案）
+## Phase 2C：実装完了（2026-11-11）
 
-- `office undo` / `application.Undoable` の公開（取り消し経路）
-- `com batch`（steps を1リクエストで、承認1回）
-- `office target prune` と expired 重複の畳み込み、`com_reference_lost` 時の hwnd/pid 再接続試行
-- `powerpoint.notes read|set`、`powerpoint.slide delete`
-- COM 戻り値の型情報（`result_type`）：`Replace` の戻り値が `bool` なのか `TextRange` の文字列化なのか判別できない問題
-- 図形名前指定（`Shapes("TextBox 7")`）のドキュメント化
+- `office undo` / `application.Undoable`：dry-run で可否報告、実行は confirm 必須（アプリ非依存の `undo` 操作）
+- `com batch`（`POST /com/batch`）：全 step を実行前に parse・ブロックリスト検査、実行は順次で最初の失敗時に停止、`get` のみなら confirm 不要
+- `office target prune`（expired を一覧から削除）と `office target reconnect <id>`（hwnd から再解決、full_name 一致ガード、`window_gone`/`document_changed` は TARGET_LOST）。TARGET_LOST details に `reconnect_available` を付与
+- `office powerpoint notes read|set`、`office powerpoint slide delete`
+- COM 戻り値の型情報 `result_type`（`type(result).__name__`）：文字列化 COM オブジェクトを同型のスカラと取り違えない
+- Curated 操作（invoke/set-property）にも `unsaved_changes` を一括付与（dry_run 以外。Excel/Word にも及ぶ）
+- 図形名前指定（`Shapes("TextBox 7")`）は 2B 実装済み・SKILL.md に記載済み
 
 ## テスト方針
 
@@ -82,6 +83,7 @@
 - `tests/test_powerpoint_ops.py`: `slides` 読み取り（分割・切り捨て）、`text.replace`（dry-run の該当数／verified）、`textbox.add`（geometry・created index・fits_in_slide）、`slide.add`
 - `tests/test_registry.py`: 新 operation の配線とアプリ検証
 - `tests/test_cli.py`: 新コマンドの invoke ペイロード、`--value @file`
+- 2C 追加: `test_com_worker.py`（batch 4種・prune・reconnect 3種・`reconnect_available`）、`test_api.py`（3エンドポイント）、`test_cli.py`（notes/slide delete/undo/batch/prune/reconnect）、`test_powerpoint_ops.py`（notes read・notes set・slide delete）、`test_registry.py`（capabilities・unsaved_changes・undo 配線）、`test_targets.py`（reactivate）
 
 ## 完了条件
 

@@ -52,6 +52,23 @@ class ComRequest(BaseModel):
     target_id: str | None = None
 
 
+class ComBatchStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: str = Field(min_length=1)
+    root: str = Field(default="window", min_length=1)
+    expression: str = Field(min_length=1)
+    value: Any = None
+    dry_run: bool = False
+
+
+class ComBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    steps: list[ComBatchStep] = Field(min_length=1)
+    confirm: bool = False
+    expected_document: str | None = None
+    target_id: str | None = None
+
+
 class CaptureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     hwnd: int | None = None
@@ -204,10 +221,32 @@ def create_app(core: BridgeCore, settings: Settings) -> FastAPI:
         )
         return _envelope_success(result, target or context_snapshot())
 
+    @app.post("/com/batch")
+    def com_batch(request: ComBatchRequest) -> dict[str, Any]:
+        params: dict[str, Any] = {"confirm": request.confirm}
+        if request.expected_document is not None:
+            params["expected_document"] = request.expected_document
+        result, target = core.com_batch(
+            [step.model_dump() for step in request.steps],
+            params,
+            request.target_id,
+        )
+        return _envelope_success(result, target or context_snapshot())
+
     @app.post("/targets/capture")
     def capture_target(request: CaptureRequest) -> dict[str, Any]:
         result = core.capture(request.hwnd)
         return _envelope_success(result["target"], context_snapshot())
+
+    @app.post("/targets/prune")
+    def prune_targets() -> dict[str, Any]:
+        result = core.prune_targets()
+        return _envelope_success(result, context_snapshot())
+
+    @app.post("/targets/{target_id}/reconnect")
+    def reconnect_target(target_id: str) -> dict[str, Any]:
+        result = core.reconnect_target(target_id)
+        return _envelope_success(result, context_snapshot())
 
     @app.get("/targets")
     def list_targets() -> dict[str, Any]:

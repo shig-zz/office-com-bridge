@@ -359,3 +359,128 @@ def test_serial_operations_across_two_targets_keep_records(core, monkeypatch) ->
     # Records kept both documents; selection untouched.
     assert [r.display_name for r in core._registry.records()] == ["Book1.xlsx", "Book2.xlsx"]  # noqa: SLF001
     assert core._registry.selected_target_id == b["target_id"]  # noqa: SLF001
+
+
+def test_com_batch_runs_get_steps_without_confirm(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+    calls: list[tuple[str, str]] = []
+
+    def fake_execute(target, mode, root, segments, value, dry_run, params, settings):  # noqa: ANN001
+        calls.append((mode, segments[0].name))
+        return {"mode": mode, "value": segments[0].name}
+
+    monkeypatch.setattr(com_worker.com_ops, "execute", fake_execute)
+    result, _summary = core.com_batch(
+        [
+            {"mode": "get", "expression": "Name"},
+            {"mode": "get", "expression": 'Sheets(2).Name'},
+        ],
+        {},
+    )
+    assert result["stopped"] is False
+    assert result["applied"] == 0
+    assert [item["ok"] for item in result["steps"]] == [True, True]
+    assert calls == [("get", "Name"), ("get", "Sheets")]
+
+
+def test_com_batch_requires_confirm_for_write_steps(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+    with pytest.raises(BridgeError) as excinfo:
+        core.com_batch([{"mode": "call", "expression": 'Rows("2:4").Insert(-4107)'}], {})
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+
+
+def test_com_batch_validates_steps_before_running(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+    with pytest.raises(BridgeError) as empty_exc:
+        core.com_batch([], {})
+    assert empty_exc.value.code == ErrorCode.INVALID_REQUEST
+
+    with pytest.raises(BridgeError) as bad_exc:
+        core.com_batch(
+            [{"mode": "get", "expression": "Name"}, {"mode": "get", "expression": "Copy("}],
+            {},
+        )
+    assert bad_exc.value.code == ErrorCode.INVALID_REQUEST
+    assert bad_exc.value.details["step"] == 1
+
+
+def test_com_batch_stops_at_first_failing_step(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+
+    def fake_execute(target, mode, root, segments, value, dry_run, params, settings):  # noqa: ANN001
+        if segments[0].name == "Boom":
+            raise BridgeError(ErrorCode.COM_ERROR, "boom", 502)
+        return {"mode": mode, "value": segments[0].name}
+
+    monkeypatch.setattr(com_worker.com_ops, "execute", fake_execute)
+    result, _summary = core.com_batch(
+        [
+            {"mode": "get", "expression": "Name"},
+            {"mode": "get", "expression": "Boom"},
+            {"mode": "get", "expression": "Name"},
+        ],
+        {},
+    )
+    assert result["stopped"] is True
+    assert [item["ok"] for item in result["steps"]] == [True, False]
+    assert result["steps"][1]["error"]["code"] == "COM_ERROR"
+
+
+def test_prune_targets_removes_expired_records(core, monkeypatch) -> None:
+    first = capture(core, monkeypatch, 1000)["target"]
+    second = capture(core, monkeypatch, 2000, pid=200, document="Book2.xlsx", full_name=r"C:\docs\Book2.xlsx")["target"]
+    core._registry.expire(first["target_id"], "window_gone")  # noqa: SLF001
+    result = core.prune_targets()
+    assert result["removed"] == [first["target_id"]]
+    assert result["count"] == 1
+    remaining = core.targets()["targets"]
+    assert [entry["target_id"] for entry in remaining] == [second["target_id"]]
+
+
+def test_reconnect_target_reattaches_live_window(core, monkeypatch) -> None:
+    target = capture(core, monkeypatch, 1000)["target"]
+    resolved = core._com_refs[target["target_id"]]  # noqa: SLF001
+    resolved.document.alive = False
+    fresh = make_resolved(hwnd=1000)
+    core._resolved_registry[1000] = fresh  # noqa: SLF001
+    monkeypatch.setattr(com_worker, "_window_exists", lambda _hwnd: True)
+
+    result = core.reconnect_target(target["target_id"])
+    assert result["reconnected"] is True
+    assert result["target"]["state"] == "active"
+    assert core._com_refs[target["target_id"]] is fresh  # noqa: SLF001
+
+
+def test_reconnect_target_reports_window_gone(core, monkeypatch) -> None:
+    target = capture(core, monkeypatch, 1000)["target"]
+    core._com_refs.pop(target["target_id"])  # noqa: SLF001
+    monkeypatch.setattr(com_worker, "_window_exists", lambda _hwnd: False)
+    with pytest.raises(BridgeError) as excinfo:
+        core.reconnect_target(target["target_id"])
+    assert excinfo.value.code == ErrorCode.TARGET_LOST
+    assert excinfo.value.details["reason"] == "window_gone"
+
+
+def test_reconnect_target_refuses_changed_document(core, monkeypatch) -> None:
+    target = capture(core, monkeypatch, 1000)["target"]
+    core._com_refs.pop(target["target_id"])  # noqa: SLF001
+    monkeypatch.setattr(com_worker, "_window_exists", lambda _hwnd: True)
+    core._resolved_registry[1000] = make_resolved(  # noqa: SLF001
+        hwnd=1000, document="Other.xlsx", full_name=r"C:\docs\Other.xlsx"
+    )
+    with pytest.raises(BridgeError) as excinfo:
+        core.reconnect_target(target["target_id"])
+    assert excinfo.value.code == ErrorCode.TARGET_LOST
+    assert excinfo.value.details["reason"] == "document_changed"
+
+
+def test_target_lost_reports_reconnect_available(core, monkeypatch) -> None:
+    target = capture(core, monkeypatch, 1000)["target"]
+    core._com_refs[target["target_id"]].document.alive = False  # noqa: SLF001
+    monkeypatch.setattr(com_worker, "_window_exists", lambda _hwnd: True)
+    with pytest.raises(BridgeError) as excinfo:
+        core.context()
+    assert excinfo.value.code == ErrorCode.TARGET_LOST
+    assert excinfo.value.details["reason"] == "com_reference_lost"
+    assert excinfo.value.details["reconnect_available"] is True

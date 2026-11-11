@@ -34,6 +34,9 @@ powerpoint_text_app = typer.Typer(help="PowerPoint text commands.", no_args_is_h
 powerpoint_textbox_app = typer.Typer(
     help="PowerPoint text box commands.", no_args_is_help=True
 )
+powerpoint_notes_app = typer.Typer(
+    help="PowerPoint speaker notes commands.", no_args_is_help=True
+)
 powerpoint_document_app = typer.Typer(
     help="PowerPoint presentation commands.", no_args_is_help=True
 )
@@ -55,6 +58,7 @@ powerpoint_app.add_typer(powerpoint_slide_app, name="slide")
 powerpoint_app.add_typer(powerpoint_slides_app, name="slides")
 powerpoint_app.add_typer(powerpoint_text_app, name="text")
 powerpoint_app.add_typer(powerpoint_textbox_app, name="textbox")
+powerpoint_app.add_typer(powerpoint_notes_app, name="notes")
 powerpoint_app.add_typer(powerpoint_document_app, name="document")
 app.add_typer(com_app, name="com")
 app.add_typer(target_app, name="target")
@@ -174,6 +178,23 @@ class BridgeClient:
         if expected_document:
             payload["expected_document"] = expected_document
         return self.request("POST", "/com", self._with_target(payload))
+
+    def com_batch(
+        self,
+        steps: list[dict[str, Any]],
+        confirm: bool,
+        expected_document: str | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"steps": steps, "confirm": confirm}
+        if expected_document:
+            payload["expected_document"] = expected_document
+        return self.request("POST", "/com/batch", self._with_target(payload))
+
+    def prune_targets(self) -> dict[str, Any]:
+        return self.request("POST", "/targets/prune", {})
+
+    def reconnect_target(self, target_id: str) -> dict[str, Any]:
+        return self.request("POST", f"/targets/{target_id}/reconnect", {})
 
 
 def _default_url() -> str:
@@ -437,6 +458,21 @@ def target_remove(
 ) -> None:
     """Unregister a document from the bridge."""
     _run(ctx, lambda client: client.remove_target(target_id))
+
+
+@target_app.command("prune")
+def target_prune(ctx: typer.Context) -> None:
+    """Remove every expired target so the list shows only live documents."""
+    _run(ctx, lambda client: client.prune_targets())
+
+
+@target_app.command("reconnect")
+def target_reconnect(
+    ctx: typer.Context,
+    target_id: str = typer.Argument(..., help="Target id printed by 'office target list'."),
+) -> None:
+    """Re-attach a target whose COM reference was lost but whose window is open."""
+    _run(ctx, lambda client: client.reconnect_target(target_id))
 
 
 @app.command()
@@ -848,6 +884,146 @@ def word_document_read(ctx: typer.Context) -> None:
     _run(ctx, lambda client: client.inspect("word.document", {}))
 
 
+@powerpoint_slide_app.command("delete")
+def powerpoint_slide_delete(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number to delete."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the title of the slide that would be deleted.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Delete a slide. This cannot be undone through the bridge; confirm first."""
+    params: dict[str, Any] = {"slide": slide, "dry_run": dry_run}
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"delete slide {slide} (ask the user to confirm this exact slide)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.slide.delete", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_notes_app.command("read")
+def powerpoint_notes_read(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+) -> None:
+    """Read the speaker notes of one slide."""
+    _run(ctx, lambda client: client.inspect("powerpoint.notes", {"slide": slide}))
+
+
+@powerpoint_notes_app.command("set")
+def powerpoint_notes_set(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    text: str = typer.Option(
+        ...,
+        "--text",
+        help="New notes text, or '@path' to read it from a UTF-8 file.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the current notes without changing them.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Replace the speaker notes of a slide."""
+    params: dict[str, Any] = {
+        "slide": slide,
+        "text": _resolve_text_argument(text),
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"set the notes of slide {slide} ({len(params['text'])} characters)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.notes.set", params)
+
+    _run(ctx, action)
+
+
+@app.command()
+def undo(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report whether anything is undoable without undoing.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to undo unless the attached document matches this name.",
+    ),
+) -> None:
+    """Undo the most recent Office action (it may be the user's own action)."""
+    params: dict[str, Any] = {"dry_run": dry_run}
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    "undo the most recent Office action (confirm the exact action with the user)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("undo", params)
+
+    _run(ctx, action)
+
+
 @powerpoint_slide_app.command("inspect")
 def powerpoint_slide_inspect(ctx: typer.Context) -> None:
     """Read the current PowerPoint slide and its shape texts."""
@@ -1197,6 +1373,91 @@ def com_set(
         else:
             confirm = False
         return client.com("set", root, expression, parsed_value, dry_run, confirm, expected_document)
+
+    _run(ctx, action)
+
+
+@com_app.command("batch")
+def com_batch(
+    ctx: typer.Context,
+    file: Path = typer.Option(
+        ...,
+        "--file",
+        help=(
+            'UTF-8 JSON file with an array of steps: '
+            '[{"mode": "get"|"call"|"set", "root": "window", "expression": "...", "value": ...}, ...]'
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Mark every step as dry_run: validate the whole batch without changing anything.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to run unless the attached document matches this name.",
+    ),
+) -> None:
+    """Run several com steps in one request with one confirmation.
+
+    Steps run in order and the batch stops at the first failure, so review the
+    whole step list with the user before approving it.
+    """
+    try:
+        raw = file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not read {file}: {exc}") from exc
+    try:
+        steps = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON in {file}: {exc}") from exc
+    if not isinstance(steps, list) or not steps:
+        raise typer.BadParameter("The batch file must contain a non-empty JSON array of steps.")
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        for step in steps:
+            if not isinstance(step, dict) or not isinstance(step.get("expression"), str):
+                raise typer.BadParameter(
+                    'Each step must be an object with at least "mode" and "expression".'
+                )
+        needs_confirm = any(
+            step.get("mode", "get") != "get"
+            and not (dry_run or step.get("dry_run", False))
+            for step in steps
+        )
+        if needs_confirm:
+            if not yes:
+                _reject_unsafe_console()
+                summary = "; ".join(
+                    f"{index}: {step.get('mode', '?')} {step['expression']}"
+                    for index, step in enumerate(steps)
+                )
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"com batch ({len(steps)} steps)\n{summary}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            confirm = True
+        else:
+            confirm = False
+        batch_steps = []
+        for step in steps:
+            entry = {
+                "mode": step.get("mode", "get"),
+                "root": step.get("root", "window"),
+                "expression": step["expression"],
+                "value": step.get("value"),
+                "dry_run": dry_run or bool(step.get("dry_run", False)),
+            }
+            batch_steps.append(entry)
+        return client.com_batch(batch_steps, confirm, expected_document)
 
     _run(ctx, action)
 

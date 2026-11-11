@@ -106,26 +106,39 @@ class FakeSlide:
         self.SlideID = 200 + index
         self.CustomLayout = SimpleNamespace(Name="Title and Content")
         self.Shapes = FakeShapes([title_shape, body_shape], title_shape)
-        placeholder = SimpleNamespace(TextFrame=FakeTextFrame(notes))
-        placeholders = _Caller(lambda n: placeholder)
+        self.notes_range = FakeTextRange(notes)
         self.NotesPage = SimpleNamespace(
-            Shapes=SimpleNamespace(Placeholders=placeholders)
+            Shapes=SimpleNamespace(
+                Placeholders=_Caller(lambda n: SimpleNamespace(TextFrame=SimpleNamespace(TextRange=self.notes_range)))
+            )
         )
+        self._container = None
+
+    def Delete(self) -> None:
+        if self._container is not None:
+            self._container.remove_slide(self)
 
 
 class FakeSlides:
     def __init__(self, slides: list[FakeSlide]) -> None:
         self._slides = slides
         self.Count = len(slides)
+        for slide in slides:
+            slide._container = self  # noqa: SLF001
 
     def __call__(self, index: int) -> FakeSlide:
         return self._slides[index - 1]
 
     def Add(self, index: int, layout: int) -> FakeSlide:
         slide = FakeSlide(index, "", "")
+        slide._container = self  # noqa: SLF001
         self._slides.insert(index - 1, slide)
         self.Count = len(self._slides)
         return slide
+
+    def remove_slide(self, slide: FakeSlide) -> None:
+        self._slides.remove(slide)
+        self.Count = len(self._slides)
 
 
 class FakePresentation:
@@ -394,4 +407,82 @@ def test_slide_add_requires_confirmation() -> None:
     target = make_target([FakeSlide(1, "One", "")])
     with pytest.raises(BridgeError) as excinfo:
         powerpoint.slide_add(target, index=None, layout=None, dry_run=False, params={})
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+
+
+def test_notes_reads_speaker_notes() -> None:
+    target = make_target([FakeSlide(1, "One", "body", notes="note text")])
+    result = powerpoint.notes(target, slide_index=1, max_text_chars=100)
+    assert result["slide"] == 1
+    assert result["notes"] == "note text"
+    assert result["characters"] == 9
+    assert result["truncated"] is False
+
+
+def test_notes_set_dry_run_previews_current_text() -> None:
+    target = make_target([FakeSlide(1, "One", "body", notes="old")])
+    result = powerpoint.notes_set(
+        target,
+        slide_index=1,
+        text="new",
+        dry_run=True,
+        max_text_chars=100,
+        params={},
+    )
+    assert result["notes_preview"] == "old"
+    assert result["changed"] is False
+    assert target.document.Slides(1).notes_range.Text == "old"
+
+
+def test_notes_set_applies_and_verifies() -> None:
+    target = make_target([FakeSlide(1, "One", "body", notes="old")])
+    result = powerpoint.notes_set(
+        target,
+        slide_index=1,
+        text="first line\nsecond line",
+        dry_run=False,
+        max_text_chars=100,
+        params={"confirm": True},
+    )
+    assert result["changed"] is True
+    assert result["verified"] is True
+    assert target.document.Slides(1).notes_range.Text == "first line\nsecond line"
+
+
+def test_notes_set_requires_confirmation() -> None:
+    target = make_target([FakeSlide(1, "One", "body", notes="old")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.notes_set(
+            target,
+            slide_index=1,
+            text="new",
+            dry_run=False,
+            max_text_chars=100,
+            params={},
+        )
+    assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED
+
+
+def test_slide_delete_dry_run_reports_title() -> None:
+    target = make_target([FakeSlide(1, "Keep", ""), FakeSlide(2, "Drop", "")])
+    result = powerpoint.slide_delete(target, slide_index=2, dry_run=True, params={})
+    assert result["dry_run"] is True
+    assert result["slide_title"] == "Drop"
+    assert result["deleted"] is False
+    assert target.document.Slides.Count == 2
+
+
+def test_slide_delete_removes_and_verifies() -> None:
+    target = make_target([FakeSlide(1, "Keep", ""), FakeSlide(2, "Drop", "")])
+    result = powerpoint.slide_delete(target, slide_index=2, dry_run=False, params={"confirm": True})
+    assert result["deleted"] is True
+    assert result["verified"] is True
+    assert result["slide_count_after"] == 1
+    assert target.document.Slides(1).SlideIndex == 1
+
+
+def test_slide_delete_requires_confirmation() -> None:
+    target = make_target([FakeSlide(1, "One", "")])
+    with pytest.raises(BridgeError) as excinfo:
+        powerpoint.slide_delete(target, slide_index=1, dry_run=False, params={})
     assert excinfo.value.code == ErrorCode.CONFIRMATION_REQUIRED

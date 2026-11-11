@@ -67,6 +67,18 @@ def require_confirm(params: dict[str, Any], operation: str) -> None:
         raise confirmation_required(operation)
 
 
+def unsaved_changes(target: ResolvedTarget) -> bool | None:
+    """Report whether the attached document has unsaved changes (None if unknown)."""
+    try:
+        saved = target.document.Saved
+    except Exception:
+        return None
+    try:
+        return not bool(saved)
+    except Exception:
+        return None
+
+
 def check_expected_document(target: ResolvedTarget, params: dict[str, Any]) -> None:
     expected = params.get("expected_document")
     if expected is None:

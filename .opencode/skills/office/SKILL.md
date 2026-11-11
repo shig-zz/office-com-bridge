@@ -17,8 +17,9 @@ The `office` CLI talks to a localhost bridge. The user registers the Office docu
 2. Pick one `target_id` per document the task touches and pass it as a **global option before the subcommand**: `office --target t-1a2b3c4d5e6f excel range read "A1:D20"`. Make `--target` a habit even when one target is registered; the bridge's default (the last captured target) is a compatibility fallback, not something to rely on for writes.
 3. The list is only current when you read it. Re-run `office target list` at the start of each task and whenever the operation's target matters; documents get opened, closed, and renamed mid-session. Before a write, re-check the write target (`office target info <id>` or `office target list`).
 4. If a document the user asked about is not in the list, ask the user to focus its window and press the bridge hotkey (default `Ctrl+Alt+O`), then run `office target list` again. Do not substitute a similar document.
-5. A target with `state: "expired"`, or a `TARGET_NOT_FOUND` / `TARGET_LOST` error, means its document was closed or its id is wrong. Nothing falls back to another document automatically: stop, and ask the user to capture it again.
-6. If the command fails with `BRIDGE_UNREACHABLE`, ask the user to start the bridge or the agent launcher. Do not try to start COM automation yourself.
+5. A target with `state: "expired"`, or a `TARGET_NOT_FOUND` / `TARGET_LOST` error, means its document was closed or its id is wrong. Nothing falls back to another document automatically: stop, and ask the user to capture it again. Exception: when a `TARGET_LOST` error carries `details.reconnect_available: true`, the window is still open and only its COM reference was lost (SharePoint sync, long idle). Run `office target reconnect <id>`: it re-attaches only when the window still shows the same document, and otherwise fails with `document_changed` or `window_gone` — never force it. After any reconnect or re-capture, read the document back before continuing writes.
+6. Expired records stay in `office target list` for auditing. Once a task is done, `office target prune` removes every expired record so the list shows only live documents.
+7. If the command fails with `BRIDGE_UNREACHABLE`, ask the user to start the bridge or the agent launcher. Do not try to start COM automation yourself.
 
 `office context` still reports the last captured target (with its `target_id`); use it for single-document sessions. Run `office capabilities` when you need the exact operation names, the general-operation syntax, the blocklist, or the limits. Never invent operations, COM method names, or command flags.
 
@@ -62,6 +63,7 @@ Prefer the narrowest read that answers the question. The examples below omit
 | Word document counts | `office word document read` |
 | Current PowerPoint slide and shapes | `office powerpoint slide inspect` |
 | PowerPoint slides with notes and shape geometry | `office powerpoint slides read --start 1 --count 20` |
+| PowerPoint speaker notes of one slide | `office powerpoint notes read 70` |
 | PowerPoint slide titles | `office powerpoint document read` |
 
 The bridge limits large reads (default: 10,000 cells and 100,000 text characters). If `RANGE_TOO_LARGE` or `TEXT_TOO_LARGE` is returned, request a smaller range or a smaller excerpt. Do not retry the same request.
@@ -77,6 +79,20 @@ Before any write:
 3. Run the same command with `--dry-run` and check the preview.
 4. Run it again with `--yes` and `--expected-document "<exact document name from context>"`.
 5. Report the JSON result. Never claim the file is saved: the bridge does not save documents.
+6. Executed writes report `unsaved_changes: true/false` from the document's `Saved` flag. When it is `true`, tell the user the document has unsaved changes and ask them to save in Office.
+
+Undoing the most recent Office action (`office undo`, any app) follows the same
+workflow, and it needs the same care as a write: undo reverts whatever the last
+action in that application was, which may be the user's own edit made outside
+the bridge. Confirm the exact action with the user first, dry-run to see whether
+anything is undoable (`undoable`), then `--yes`:
+
+```text
+office undo --dry-run --expected-document "Deck.pptx"
+office undo --yes --expected-document "Deck.pptx"
+```
+
+Never use undo to quietly clean up a failed write without the user's approval.
 
 Excel literal values:
 
@@ -270,6 +286,15 @@ expressions. On this Office build the object model behaves as follows:
 
 - Add slides with `powerpoint slide add [--index N]` (default: append, Title and
   Content layout); the response lists the new slide's placeholder shapes.
+- Read one slide's speaker notes with `powerpoint notes read <n>`. Replace them
+  with `powerpoint notes set <n> --text ...` (write workflow applies; long text
+  goes through `--text @file.txt`). Dry-run previews the current notes, the run
+  reads them back and returns `verified`.
+- Delete a slide with `powerpoint slide delete <n>` (write workflow applies).
+  Dry-run reports the `slide_title` of the slide that would be removed — read it
+  back to the user and confirm that exact slide, because the bridge cannot undo
+  the delete for them (they can in PowerPoint). The run verifies the slide count
+  dropped by one.
 - Check the autofit before appending a paragraph to an existing placeholder: one
   set to shrink text on overflow shrinks *every* line in that placeholder. Put the
   addition in its own text box in a free band instead; `powerpoint slides read`
@@ -374,13 +399,14 @@ office com set 'window.Selection.Font.Bold' --value true
 ```
 
 - `com get EXPR` — read a property (no confirmation). EXPR ends with a property name.
-- `com call EXPR` — call a method (write workflow applies). EXPR ends with `(arguments)`.
+- `com call EXPR` — call a method (write workflow applies). EXPR ends with `(arguments)`. The result carries `result_type`, the real type name of the returned value (`Boolean`, `Nothing`, `Presentation`...), so a stringified COM object is never mistaken for a scalar of the same printed form.
 - `com set EXPR --value V` — set a property (write workflow applies). EXPR ends with a property name. V is JSON (`42`, `true`, `"text"`, `[[1,2],[3,4]]`) or a plain string.
   - A two-dimensional value array for `Value2` (for example `[[1,2],[3,4]]`) is passed to COM as a tuple of tuples (the same shape `excel.range.write` uses), so it lands in the individual cells correctly. Scalars and one-dimensional arrays are passed through unchanged.
   - `--value @path` reads the value from a UTF-8 file instead of the command line. Use it for long or multi-line text (especially Japanese) so shell quoting and code pages cannot corrupt it. `--replace @path` and `--text @path` on the PowerPoint commands work the same way.
   - String literals in expressions support `\n`, `\t`, `\r`, `\v` (vertical tab), `\/`, and `\uXXXX`, so PowerPoint paragraphs and soft line breaks can be written without putting raw control characters on the command line.
 - When a member name is rejected, `error.details.did_you_mean` lists the real member names on that object and `error.details.hint` suggests the standard substitute. Use them; do not guess more names.
 - `com set` reports `applied_via: "parameterized_property"` when the name was set by calling it (Office parameterized properties), and executed writes report `unsaved_changes: true/false` from the document's `Saved` flag — pass that on to the user, who must save in Office.
+- `com batch --file steps.json` runs several steps in one request with one confirmation. The file is a JSON array of `{"mode": "get"|"call"|"set", "root": "window", "expression": "...", "value": ...}` objects. All steps are parsed and block-checked up front (an error names the failing `details.step` before anything runs), then they run in order and the batch stops at the first failure with `stopped: true`. `--dry-run` marks every step dry. A batch of only `get` steps needs no confirmation; any write step does. Use it for multi-step choreographies so the user approves the whole plan once.
 
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
 xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,
@@ -472,7 +498,7 @@ around the blocklist (for example via a macro).
   - `TARGET_NOT_SET`: nothing is captured yet; ask the user to press the hotkey on an Office window.
   - `TARGET_NOT_FOUND`: the `--target` id is not registered; re-run `office target list`, do not guess.
   - `NOT_OFFICE_WINDOW`: the focused window was not an Office document window.
-  - `TARGET_LOST`: the target's document closed (`details.reason` says why); ask the user to reopen it and press the hotkey. Never retry against a different target. After the user re-captures, first read back the document to confirm writes applied earlier are still present (the document may have been reloaded or undone), then re-run pending writes against the new target id — dry-run again, do not reuse the old id.
+  - `TARGET_LOST`: the target's document closed or its COM reference was dropped (`details.reason` says why). When `details.reconnect_available` is true, try `office target reconnect <id>` first; otherwise ask the user to reopen it and press the hotkey. Never retry against a different target. After a reconnect or re-capture, first read back the document to confirm writes applied earlier are still present (the document may have been reloaded or undone), then re-run pending writes against the (new) target id — dry-run again, do not reuse a stale id.
   - `DOCUMENT_MISMATCH`: the routed target's document is not the one named in `--expected-document`; the ids/paths in `details` show which is which.
   - `CONFIRMATION_REQUIRED`: call again with `--yes` only after user approval.
   - `OPERATION_BLOCKED`: the operation is save/close family; ask the user to do it in Office.

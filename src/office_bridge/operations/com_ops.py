@@ -25,7 +25,13 @@ from ..errors import (
     operation_blocked,
 )
 from ..target import AppKind, ResolvedTarget
-from .common import check_expected_document, jsonable, require_confirm, truncate_text
+from .common import (
+    check_expected_document,
+    jsonable,
+    require_confirm,
+    truncate_text,
+    unsaved_changes,
+)
 
 MODES = ("get", "call", "set")
 ROOTS = ("application", "window", "document")
@@ -184,7 +190,8 @@ def execute(
             "method": last.name,
             "arguments": [jsonable(item) for item in last_args],
             "result": jsonable(result),
-            "unsaved_changes": _unsaved_changes(target),
+            "result_type": _result_type(result),
+            "unsaved_changes": unsaved_changes(target),
         }
         if resolved_notes:
             payload["resolved_arguments"] = resolved_notes
@@ -233,7 +240,7 @@ def execute(
         "property": last.name,
         "value": jsonable(com_value),
         "applied_via": applied_via,
-        "unsaved_changes": _unsaved_changes(target),
+        "unsaved_changes": unsaved_changes(target),
     }
 
 
@@ -325,16 +332,10 @@ def _is_callable_member(owner: Any, name: str) -> bool:
         return False
 
 
-def _unsaved_changes(target: ResolvedTarget) -> bool | None:
-    """Report whether the attached document has unsaved changes (None if unknown)."""
-    try:
-        saved = target.document.Saved
-    except Exception:
-        return None
-    try:
-        return not bool(saved)
-    except Exception:
-        return None
+def _result_type(result: Any) -> str:
+    """Name the returned type so a stringified COM object cannot be mistaken
+    for a scalar of the same printed form (for example TextRange.Replace)."""
+    return type(result).__name__
 
 
 def _member_candidates(owner: Any, name: str, limit: int = 12) -> list[str]:

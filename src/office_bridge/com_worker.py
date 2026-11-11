@@ -18,6 +18,7 @@ from .config import Settings
 from .errors import (
     BridgeError,
     com_error,
+    confirmation_required,
     internal_error,
     invalid_request,
     office_busy,
@@ -332,6 +333,77 @@ class BridgeCore:
             timeout=self.settings.request_timeout,
         )
 
+    def prune_targets(self) -> dict[str, Any]:
+        return self.worker.call(self._prune_targets, timeout=self.settings.request_timeout)
+
+    def _prune_targets(self) -> dict[str, Any]:
+        """Drop every expired target so the list shows only live documents."""
+        removed = self._registry.purge_expired(max_records=0)
+        for target_id in removed:
+            self._com_refs.pop(target_id, None)
+        self._refresh_caches()
+        if removed:
+            logger.info("targets pruned: %d expired record(s) removed", len(removed))
+        return {"removed": removed, "count": len(removed)}
+
+    def reconnect_target(self, target_id: str) -> dict[str, Any]:
+        return self.worker.call(
+            self._reconnect_target,
+            str(target_id),
+            timeout=self.settings.request_timeout,
+        )
+
+    def _reconnect_target(self, target_id: str) -> dict[str, Any]:
+        """Re-attach the COM reference for a lost target whose window still exists.
+
+        SharePoint sync and long idle periods can drop the cached COM pointers
+        while the Office window stays open. Re-resolving from the stored hwnd
+        restores the target without asking the user to press the hotkey again,
+        but only when the window still shows the same document.
+        """
+        record = self._registry.get(target_id)
+        if record is None:
+            raise target_not_found(target_id)
+        resolved = self._com_refs.get(target_id)
+        if record.state is TargetState.ACTIVE and resolved is not None and resolved.is_alive():
+            return {"target": record.public(), "note": "The target is already attached."}
+        hwnd = record.app_metadata.get("hwnd")
+        if not hwnd or not _window_exists(int(hwnd)):
+            self._expire_target(target_id, "window_gone")
+            raise target_lost(
+                "The document window is gone; ask the user to reopen it and press the hotkey.",
+                {"target_id": target_id, "reason": "window_gone"},
+            )
+        fresh = resolve_target(int(hwnd))
+        info = fresh.refresh_info()
+        expected = str(record.metadata.get("full_name") or "")
+        found = str(info.get("full_name") or "")
+        if expected and found and expected.lower() != found.lower():
+            raise target_lost(
+                "The window now shows a different document; ask the user to press "
+                "the hotkey to capture it.",
+                {
+                    "target_id": target_id,
+                    "reason": "document_changed",
+                    "expected": expected,
+                    "found": found,
+                },
+            )
+        self._com_refs[target_id] = fresh
+        self._registry.reactivate(target_id)
+        self._registry.select(target_id)
+        self._sync_record(target_id, info)
+        self._refresh_caches()
+        updated = self._registry.get(target_id)
+        logger.info(
+            "target re-attached: id=%s application=%s document=%s hwnd=%s",
+            target_id,
+            updated.app_type,
+            updated.display_name,
+            hwnd,
+        )
+        return {"target": updated.public(), "reconnected": True}
+
     def _remove_target(self, target_id: str) -> dict[str, Any]:
         record = self._registry.remove(target_id)
         if record is None:
@@ -486,6 +558,126 @@ class BridgeCore:
             target_id,
         )
 
+    def com_batch(
+        self,
+        steps: list[dict[str, Any]],
+        params: dict[str, Any],
+        target_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Run several com steps in one request; one confirmation covers them all.
+
+        Every step goes through the same blocklist and validation as a single
+        com call. Execution stops at the first failing step.
+        """
+        if not isinstance(steps, list) or not steps:
+            raise invalid_request("Parameter 'steps' must be a non-empty array of com steps.")
+        parsed: list[dict[str, Any]] = []
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise invalid_request(
+                    "Each batch step must be an object.", {"step": index}
+                )
+            mode = step.get("mode")
+            if mode not in com_ops.MODES:
+                raise invalid_request(
+                    f"Step {index}: mode must be one of: {', '.join(com_ops.MODES)}.",
+                    {"step": index, "mode": mode},
+                )
+            expression = step.get("expression")
+            if not isinstance(expression, str) or not expression.strip():
+                raise invalid_request(
+                    f"Step {index}: expression is required.", {"step": index}
+                )
+            try:
+                segments = parse_expression(expression)
+            except BridgeError as exc:
+                exc.details = {**(exc.details or {}), "step": index}
+                raise
+            parsed.append(
+                {
+                    "mode": mode,
+                    "root": str(step.get("root") or "window"),
+                    "segments": segments,
+                    "value": step.get("value"),
+                    "dry_run": bool(step.get("dry_run", False)),
+                }
+            )
+        if (
+            any(step["mode"] != "get" and not step["dry_run"] for step in parsed)
+            and params.get("confirm") is not True
+        ):
+            raise confirmation_required("com.batch")
+        return self.worker.call(
+            self._com_batch,
+            parsed,
+            params,
+            target_id,
+            timeout=self.settings.write_timeout,
+        )
+
+    def _com_batch(
+        self,
+        parsed: list[dict[str, Any]],
+        params: dict[str, Any],
+        target_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        results: list[dict[str, Any]] = []
+        stopped = False
+        last_summary: dict[str, Any] | None = None
+        for index, step in enumerate(parsed):
+            try:
+                result, summary = self._execute(
+                    f"com.batch[{index}].{step['mode']}",
+                    lambda target, step=step: com_ops.execute(
+                        target,
+                        step["mode"],
+                        step["root"],
+                        step["segments"],
+                        step["value"],
+                        step["dry_run"],
+                        params,
+                        self.settings,
+                    ),
+                    target_id,
+                )
+            except BridgeError as exc:
+                results.append(
+                    {
+                        "step": index,
+                        "ok": False,
+                        "mode": step["mode"],
+                        "error": exc.to_dict(),
+                    }
+                )
+                stopped = True
+                break
+            if isinstance(result, dict):
+                result = {key: value for key, value in result.items() if key != "target"}
+            results.append({"step": index, "ok": True, "mode": step["mode"], "result": result})
+            last_summary = summary
+        payload = {
+            "steps": results,
+            "applied": sum(
+                1
+                for item in results
+                if item["ok"]
+                and not parsed[item["step"]]["dry_run"]
+                and parsed[item["step"]]["mode"] != "get"
+            ),
+            "stopped": stopped,
+        }
+        return payload, last_summary
+
+    def _window_still_open(self, target_id: str | None) -> bool:
+        """True when a lost target's window still exists, so re-attach is possible."""
+        if target_id is None:
+            return False
+        record = self._registry.get(target_id)
+        if record is None:
+            return False
+        hwnd = record.app_metadata.get("hwnd")
+        return bool(hwnd) and _window_exists(int(hwnd))
+
     def _require_target(self) -> ResolvedTarget:
         selected_id = self._registry.selected_target_id
         if selected_id is None:
@@ -501,7 +693,11 @@ class BridgeCore:
         if resolved is None or not resolved.is_alive():
             self._expire_target(selected_id, "com_reference_lost")
             raise target_lost(
-                details={"target_id": selected_id, "reason": "com_reference_lost"}
+                details={
+                    "target_id": selected_id,
+                    "reason": "com_reference_lost",
+                    "reconnect_available": self._window_still_open(selected_id),
+                }
             )
         return resolved
 
@@ -548,7 +744,11 @@ class BridgeCore:
             if resolved is None or not resolved.is_alive():
                 self._expire_target(target_id, "com_reference_lost")
                 raise target_lost(
-                    details={"target_id": target_id, "reason": "com_reference_lost"}
+                    details={
+                        "target_id": target_id,
+                        "reason": "com_reference_lost",
+                        "reconnect_available": self._window_still_open(target_id),
+                    }
                 )
             return resolved, target_id
         if self._registry.selected_target_id is None:

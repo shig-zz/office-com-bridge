@@ -165,3 +165,23 @@ def test_public_and_summary_shape() -> None:
     listing = registry.list_public()
     assert len(listing) == 1
     assert listing[0]["target_id"] == record.target_id
+
+
+def test_reactivate_restores_expired_record() -> None:
+    registry = TargetRegistry()
+    record = registry.add(
+        app_type="excel",
+        display_name="Book1.xlsx",
+        dedupe_key="100:c:\\docs\\book1.xlsx",
+        metadata={},
+        app_metadata={"hwnd": 1000, "pid": 100},
+    )
+    registry.select(record.target_id)
+    registry.expire(record.target_id, "com_reference_lost")
+    assert record.state is TargetState.EXPIRED
+    assert registry.selected_target_id is None
+
+    reactivated = registry.reactivate(record.target_id)
+    assert reactivated is record
+    assert record.state is TargetState.ACTIVE
+    assert record.expired_reason is None

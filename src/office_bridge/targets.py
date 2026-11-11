@@ -182,6 +182,16 @@ class TargetRegistry:
             self.selected_target_id = None
         return record
 
+    def reactivate(self, target_id: str, now: str | None = None) -> TargetRecord | None:
+        """Bring an expired record back to active after a successful re-attach."""
+        record = self._records.get(target_id)
+        if record is None:
+            return None
+        record.state = TargetState.ACTIVE
+        record.expired_reason = None
+        record.last_refreshed_at = now or utc_now()
+        return record
+
     def remove(self, target_id: str) -> TargetRecord | None:
         record = self._records.pop(target_id, None)
         if record is None:

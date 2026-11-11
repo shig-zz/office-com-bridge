@@ -20,6 +20,9 @@ class FakeCore:
         self.summary = {"application": "Excel", "document": "Book1.xlsx"}
         self.set_calls: list[tuple[str, Any, dict[str, Any], str | None]] = []
         self.com_calls: list[tuple[str, str, str, Any, bool, dict[str, Any], str | None]] = []
+        self.com_batch_calls: list[tuple[list[dict[str, Any]], dict[str, Any], str | None]] = []
+        self.prune_calls: list[bool] = []
+        self.reconnect_calls: list[str] = []
         self.inspect_calls: list[tuple[str, dict[str, Any], str | None]] = []
         self.invoke_calls: list[tuple[str, dict[str, Any], str | None]] = []
         self.capture_calls: list[int | None] = []
@@ -73,6 +76,25 @@ class FakeCore:
             (mode, root, expression, value, dry_run, params, target_id)
         )
         return {"mode": mode, "root": root, "expression": expression}, dict(self.summary)
+
+    def com_batch(
+        self,
+        steps: list[dict[str, Any]],
+        params: dict[str, Any],
+        target_id: str | None = None,
+    ):
+        self.com_batch_calls.append((steps, params, target_id))
+        return {"steps": [{"step": i, "ok": True} for i in range(len(steps))], "stopped": False}, dict(self.summary)
+
+    def prune_targets(self):
+        self.prune_calls.append(True)
+        return {"removed": ["t-expired00000"], "count": 1}
+
+    def reconnect_target(self, target_id: str):
+        self.reconnect_calls.append(target_id)
+        if target_id == "t-missing00000":
+            raise BridgeError(ErrorCode.TARGET_NOT_FOUND, "gone", 404)
+        return {"target": {"target_id": target_id, "state": "active"}, "reconnected": True}
 
     def cached_targets(self):
         return [dict(self.summary)]
@@ -239,6 +261,55 @@ def test_com_rejects_missing_expression() -> None:
     response = client.post("/com", json={"mode": "get"})
     assert response.status_code == 400
     assert response.json()["ok"] is False
+
+
+def test_com_batch_passes_steps_and_flags() -> None:
+    core = FakeCore()
+    client = TestClient(create_app(core, Settings()))
+    response = client.post(
+        "/com/batch",
+        json={
+            "steps": [
+                {"mode": "get", "expression": "Name"},
+                {"mode": "call", "root": "document", "expression": "Reorder()"},
+            ],
+            "confirm": True,
+            "expected_document": "Book1.xlsx",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["stopped"] is False
+    steps, params, target_id = core.com_batch_calls[0]
+    assert steps[0]["expression"] == "Name"
+    assert steps[1]["mode"] == "call"
+    assert steps[1]["root"] == "document"
+    assert params == {"confirm": True, "expected_document": "Book1.xlsx"}
+    assert target_id is None
+
+
+def test_com_batch_requires_steps() -> None:
+    client = TestClient(create_app(FakeCore(), Settings()))
+    response = client.post("/com/batch", json={"steps": []})
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+
+
+def test_targets_prune_and_reconnect_endpoints() -> None:
+    core = FakeCore()
+    client = TestClient(create_app(core, Settings()))
+    response = client.post("/targets/prune")
+    assert response.status_code == 200
+    assert response.json()["result"] == {"removed": ["t-expired00000"], "count": 1}
+
+    response = client.post("/targets/t-aaaa1111aaaa/reconnect")
+    assert response.status_code == 200
+    assert response.json()["result"]["reconnected"] is True
+    assert core.reconnect_calls == ["t-aaaa1111aaaa"]
+
+    response = client.post("/targets/t-missing00000/reconnect")
+    assert response.status_code == 404
 
 
 def test_health_includes_target_count(client: TestClient) -> None:

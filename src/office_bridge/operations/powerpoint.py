@@ -596,3 +596,143 @@ def slide_add(
         }
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Read/write: speaker notes
+
+
+def _notes_text_range(slide: Any, slide_index: int) -> Any:
+    try:
+        placeholder = slide.NotesPage.Shapes.Placeholders(2)
+        return placeholder.TextFrame.TextRange
+    except Exception as exc:
+        raise _slide_error(
+            f"Slide {slide_index} has no notes placeholder.", exc
+        ) from exc
+
+
+def _same_text(left: str, right: str) -> bool:
+    def normalize(value: str) -> str:
+        return value.replace("\r\n", "\r").replace("\n", "\r")
+
+    return normalize(left) == normalize(right)
+
+
+def notes(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    max_text_chars: int,
+) -> dict[str, Any]:
+    slide = _slide_at(target.document, slide_index)
+    text_range = _notes_text_range(slide, slide_index)
+    try:
+        text = str(text_range.Text)
+    except Exception as exc:
+        raise _slide_error("The notes could not be read.", exc) from exc
+    notes_text, truncated = truncate_text(text, max_text_chars)
+    return {
+        "application": "PowerPoint",
+        "slide": slide_index,
+        "notes": notes_text,
+        "characters": len(text),
+        "truncated": truncated,
+    }
+
+
+def notes_set(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    text: Any,
+    dry_run: bool,
+    max_text_chars: int,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(text, str):
+        raise invalid_request("Parameter 'text' must be a string.")
+    if max_text_chars > 0 and len(text) > max_text_chars:
+        raise invalid_request(
+            "Parameter 'text' is longer than the configured text limit.",
+            {"characters": len(text), "limit": max_text_chars},
+        )
+    check_expected_document(target, params)
+
+    slide = _slide_at(target.document, slide_index)
+    text_range = _notes_text_range(slide, slide_index)
+    before = str(text_range.Text)
+
+    result: dict[str, Any] = {
+        "application": "PowerPoint",
+        "dry_run": dry_run,
+        "changed": False,
+        "slide": slide_index,
+        "characters_before": len(before),
+        "characters_after": len(text),
+        "notes_preview": truncate_text(before, max_text_chars)[0],
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "powerpoint.notes.set")
+
+    try:
+        text_range.Text = text
+        after = str(text_range.Text)
+    except Exception as exc:
+        raise _slide_error("The notes could not be changed.", exc) from exc
+
+    result.update(
+        {
+            "changed": after != before,
+            "verified": _same_text(after, text),
+            "notes_preview": truncate_text(after, max_text_chars)[0],
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Write: delete a slide
+
+
+def slide_delete(
+    target: ResolvedTarget,
+    *,
+    slide_index: Any,
+    dry_run: bool,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    presentation = target.document
+    check_expected_document(target, params)
+
+    slide = _slide_at(presentation, slide_index)
+    total = _slide_count(presentation)
+    title = _slide_title(slide)
+
+    result: dict[str, Any] = {
+        "application": "PowerPoint",
+        "dry_run": dry_run,
+        "deleted": False,
+        "slide": slide_index,
+        "slide_title": title,
+        "slide_count_before": total,
+    }
+    if dry_run:
+        return result
+    require_confirm(params, "powerpoint.slide.delete")
+
+    try:
+        slide.Delete()
+    except Exception as exc:
+        raise _slide_error("The slide could not be deleted.", exc) from exc
+
+    after = _slide_count(presentation)
+    result.update(
+        {
+            "deleted": True,
+            "verified": after == total - 1,
+            "slide_count_after": after,
+        }
+    )
+    return result

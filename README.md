@@ -102,9 +102,16 @@ office powerpoint slides read --start 1 --count 20
 office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
 office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "Note" --yes
 office powerpoint slide add --index 70 --yes
+office powerpoint notes read 70
+office powerpoint notes set 70 --text "Speaker note" --yes
+office powerpoint slide delete 71 --dry-run
+office undo --dry-run
 office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
+office com batch --file steps.json --yes
+office target prune
+office target reconnect t-1a2b3c4d5e6f
 ```
 
 `--target <target_id>` (a global option, before the subcommand) routes the
@@ -112,7 +119,10 @@ command to a captured target. Without it the bridge falls back to the last
 captured target; that is a compatibility default, so pass `--target` on every
 command in multi-document work. `office target list` shows every registered
 target with its `target_id` and `state`; `office target remove <id>` unregisters
-one.
+one. `office target prune` drops every expired record from the list. When a
+target's window is still open but its COM reference was dropped (SharePoint
+sync, long idle), `office target reconnect <id>` re-attaches it from the stored
+window handle; it refuses when the window shows a different document.
 
 Writes require confirmation. `--dry-run` validates without changing the
 document; `--yes` skips the interactive prompt. Use `--expected-document` to
@@ -140,12 +150,15 @@ All endpoints return an envelope:
 | `GET /capabilities` | Supported inspections, operations, properties, and general-operation info |
 | `GET /targets` | Registered targets with `target_id` and `state` |
 | `POST /targets/capture` | Capture a target by `hwnd` (tests; normally the hotkey captures) |
+| `POST /targets/prune` | Remove every expired target from the list |
 | `GET /targets/{target_id}` | One target's details with a full liveness check |
+| `POST /targets/{target_id}/reconnect` | Re-attach a lost target whose window still shows the same document |
 | `DELETE /targets/{target_id}` | Unregister a target |
 | `POST /inspect` | Read a document/selection view |
 | `POST /invoke` | Run a curated write operation |
 | `POST /set-property` | Change a curated property |
 | `POST /com` | General object-model access: `get`, `call`, or `set` on the attached document |
+| `POST /com/batch` | Run an array of `com` steps in one request, stopping at the first failure |
 
 Operation requests accept an optional top-level `target_id`; when omitted they
 use the last captured target. Operation results start with a `target` block and
@@ -181,10 +194,18 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
 - `powerpoint.slide.add` inserts a slide at a 1-based position (default: end)
   with a layout number (default 2, Title and Content) and returns the new
   slide's placeholders
+- `powerpoint.notes.set` replaces one slide's speaker notes; dry-run previews
+  the current notes, the run reads them back and returns `verified`
+- `powerpoint.slide.delete` deletes one slide by 1-based number; dry-run reports
+  the slide's title, the run verifies the slide count dropped by one
+- `undo` undoes the most recent Office action in the attached application
+  (`application.Undo`); dry-run reports whether anything is undoable
+  (`application.Undoable`)
 - `excel.active_sheet` through `/set-property`
 
 Write operations support `dry_run` and, except for dry runs, require `confirm`.
-Property changes also require `confirm`.
+Property changes also require `confirm`. Executed writes report
+`unsaved_changes` so the agent can ask the user to save in Office.
 
 ## General operations
 
@@ -202,7 +223,15 @@ expression chaining members, for example:
 `get` reads a property, `call` invokes a method, and `set` assigns a property
 from `value`. The leading root segment in the expression selects the root when
 no conflicting `root` is given. `call` and `set` support `dry_run` and, except
-for dry runs, require `confirm`.
+for dry runs, require `confirm`. Executed `call` results also carry
+`result_type`, the type name of the returned value, so a stringified COM object
+cannot be mistaken for a scalar of the same printed form.
+
+`POST /com/batch` (CLI: `office com batch --file steps.json`) takes the same
+fields plus a non-empty `steps` array, runs the steps in order on one target,
+and stops at the first failing step (`stopped: true`). Every step is parsed and
+block-checked before anything runs, and one `confirm` covers the whole batch; a
+batch of only `get` steps needs no confirmation.
 
 Unknown member names come back as `INVALID_REQUEST` with `details.did_you_mean`
 (candidate member names on the target object) and `details.hint` (the standard
