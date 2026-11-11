@@ -234,7 +234,10 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   font back and reports `verified`
 - `undo` undoes the most recent Office action in the attached application
   (`application.Undo`); dry-run reports whether anything is undoable
-  (`application.Undoable`)
+  (`application.Undoable`). Per-app status on this build: PowerPoint calls
+  work, Word's Undo call itself fails for any change (the error hints at the
+  UI's Ctrl+Z), Excel is untested — for risky experiments, work on a
+  file-level copy instead of relying on undo
 - `excel.active_sheet` through `/set-property`
 
 Write operations support `dry_run` and, except for dry runs, require `confirm`.

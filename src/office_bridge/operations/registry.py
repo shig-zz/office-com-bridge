@@ -996,7 +996,11 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                     "Dry-run reports whether anything is undoable "
                     "(application.Undoable). Undoing reverts the user's own "
                     "actions too, so confirm the exact action with the user "
-                    "before running."
+                    "before running. Per-app status on this build: PowerPoint "
+                    "calls work, Word's Undo call itself raises an error for "
+                    "any change (the error carries a hint to use the UI's "
+                    "Ctrl+Z instead), Excel is untested — plan writes so they "
+                    "do not depend on undo being possible."
                 ),
                 "requires_confirmation": True,
                 "params": {

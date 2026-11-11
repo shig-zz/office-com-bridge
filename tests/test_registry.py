@@ -206,6 +206,21 @@ def test_undo_dry_run_and_execution() -> None:
     assert calls == [True]
 
 
+def test_undo_failure_points_at_the_ui_ctrl_z() -> None:
+    # Measured on the installed Word build: application.Undo raises for any
+    # pending change, so the error must redirect to the UI's Ctrl+Z.
+    target = make_target(AppKind.WORD)
+
+    def boom() -> None:
+        raise RuntimeError("This command is not available")
+
+    target.application = SimpleNamespace(Undo=boom)
+    with pytest.raises(BridgeError) as excinfo:
+        registry.invoke(target, "undo", {"confirm": True}, _settings)
+    assert excinfo.value.code == ErrorCode.COM_ERROR
+    assert "Ctrl+Z" in excinfo.value.details["hint"]
+
+
 def test_slides_inspection_dispatches_to_powerpoint() -> None:
     from test_powerpoint_ops import FakeSlide
     from test_powerpoint_ops import make_target as make_deck_target

@@ -19,7 +19,15 @@ from .common import check_expected_document, require_confirm, unsaved_changes
 
 def _undo_error(message: str, exc: BaseException) -> BridgeError:
     hresult = getattr(exc, "hresult", None)
-    details: dict[str, Any] = {"error": str(exc)}
+    details: dict[str, Any] = {
+        "error": str(exc),
+        "hint": (
+            "this Office build can reject the programmatic Undo call even when "
+            "a change is pending (measured on Word: the call raises for any "
+            "change); ask the user to press Ctrl+Z in the Office UI instead, "
+            "then read the affected content back to confirm"
+        ),
+    }
     if hresult is not None:
         details["hresult"] = f"0x{int(hresult) & 0xFFFFFFFF:08X}"
     return BridgeError(ErrorCode.COM_ERROR, message, 502, details)

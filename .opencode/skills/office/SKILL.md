@@ -84,7 +84,7 @@ Before any write:
 5. Report the JSON result. Never claim the file is saved: the bridge does not save documents.
 6. Executed writes report `unsaved_changes: true/false` from the document's `Saved` flag. When it is `true`, tell the user the document has unsaved changes and ask them to save in Office.
 
-Undoing the most recent Office action (`office undo`, any app) follows the same
+Undoing the most recent Office action (`office undo`) follows the same
 workflow, and it needs the same care as a write: undo reverts whatever the last
 action in that application was, which may be the user's own edit made outside
 the bridge. Confirm the exact action with the user first, dry-run to see whether
@@ -94,6 +94,17 @@ anything is undoable (`undoable`), then `--yes`:
 office undo --dry-run --expected-document "Deck.pptx"
 office undo --yes --expected-document "Deck.pptx"
 ```
+
+Per-app status on this build — do not assume undo works everywhere:
+
+- **PowerPoint**: the call works (measured); `Undoable` itself is not exposed,
+  so dry-run reports `undoable: null`.
+- **Word**: `application.Undo` itself raises a COM error for any pending
+  change — programmatic undo is unavailable. The error carries a `hint`; relay
+  it and ask the user to press **Ctrl+Z in the Word UI** instead, then read the
+  content back. Never promise an undo for a Word write: run risky Word
+  experiments on a copy (next subsection) instead.
+- **Excel**: untested; treat as possibly unavailable.
 
 Never use undo to quietly clean up a failed write without the user's approval.
 Destructive writes (`slide delete`, `shape delete`, `rows/columns delete`) return
@@ -106,6 +117,28 @@ whether anything is undoable. Only an explicit `undoable: false` makes
 call always runs, and if Office had nothing to undo it still reports success
 without changing anything. When `undoable` is `null`, read the affected content
 back after the undo instead of trusting `executed: true`.
+
+Experimenting on a copy:
+
+Try risky, unmeasured, or undo-dependent operations on a **file-level copy**,
+never on the user's approved document. The copy is made on disk, not through
+Office, so no save is involved and the original stays untouched:
+
+1. Ask the user to save the original first: the copy carries the last saved
+   state only.
+2. Copy the file (the agent's own shell does this, not the bridge):
+   `Copy-Item "Pamphlet.docx" "Pamphlet_実験.docx"`.
+3. The user opens the copy and captures it (hotkey), or you capture its window
+   by handle. Keep both targets; route every experiment through the copy's id.
+4. Writes use the normal workflow with `--expected-document "<copy name>"`: the
+   copy's exact name makes a mis-routed command fail with `DOCUMENT_MISMATCH`
+   instead of hitting the original.
+5. Report what happened and let the user decide: keep the copy (save it),
+   re-run the verified steps against the original, or close the copy without
+   saving.
+
+This is also the only rollback path where programmatic undo is unavailable
+(Word, above): an experiment that must be discardable runs on the copy.
 
 Excel literal values:
 
