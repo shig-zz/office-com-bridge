@@ -140,6 +140,37 @@ Office, so no save is involved and the original stays untouched:
 This is also the only rollback path where programmatic undo is unavailable
 (Word, above): an experiment that must be discardable runs on the copy.
 
+Clone route (when unsaved state matters):
+
+To sandbox experiments without touching the disk at all — and to carry the
+document's **unsaved, live state** (a file-level copy only carries the last
+saved state) — clone the live body into a scratch document:
+
+```text
+office --target <orig-id> com call 'document.Content.Copy()' --yes --expected-document "Pamphlet.docx"
+office --target <orig-id> com call 'application.Documents.Add()' --yes --expected-document "Pamphlet.docx"
+office target list    # the scratch document shows as an unnamed "Document N" window; capture it
+office target capture --hwnd <scratch-hwnd>
+office --target <scratch-id> com call 'document.Content.Paste()' --yes --expected-document "文書 3"
+```
+
+- Travels with the paste: the whole main story — body text, tables (tables are
+  part of the body), inline images (all measured on a real deck).
+- Travels only conditionally: page setup, styles and header/footer contents
+  matched the original in a live test because both documents derive from the
+  same Normal template; a document that drifted from the template drifts here.
+- Does not travel: floating shapes and text boxes, header-embedded elements
+  (watermarks), document properties. The scratch document also opens in the
+  current compatibility mode, not the original's (measured: 14 → 15) — do not
+  use the clone route for pagination-sensitive experiments.
+- The paste leaves one extra trailing paragraph (the scratch's initial empty
+  paragraph ends up after the pasted body).
+- It uses the clipboard: no other clipboard work may run concurrently, and
+  tell the user the clipboard now holds the whole body.
+- Discarding the experiment is closing the scratch document without saving —
+  the true "full revert" on the Word build where programmatic undo fails.
+  Keeping it as an artifact needs the user to Save As in the UI.
+
 Excel literal values:
 
 ```text

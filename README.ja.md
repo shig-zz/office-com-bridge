@@ -159,7 +159,7 @@ office target reconnect t-1a2b3c4d5e6f
 - `powerpoint.slide.move` — 指定スライドを新しい位置へ移動する(`Slides(n).MoveTo`)。dry-runはタイトルと移動方向を返し、実行後は同じSlideIDが目的地indexに着いたことを検証する
 - `powerpoint.shape.delete` — 図形をindexまたは名前で削除する。dry-runは図形名・種類・テキストプレビューを返し、実行後は図形数が1減ったことを検証して取り消し案内(`undo_hint`)を付ける
 - `powerpoint.shape.set_format` — 指定図形のテキスト書式(`font_size`・`font_name`・RRGGBBの`color`・`bold`)を設定する。書き込むのは`TextFrame.TextRange.Font`だけで、図形枠や塗りには触れない。dry-runは現在値と変更予定を返し、実行後は読み戻して`verified`を付ける
-- `undo` — 接続済みアプリの直近の操作を取り消す(`application.Undo`)。dry-runは取り消し可能性があるか(`application.Undoable`)を返す。アプリ別の実測状態:PowerPointは呼べる、WordはこのビルドでUndo呼び出し自体が失敗する(エラーにUIのCtrl+Zへの案内が入る)、Excelは未検証——危険な実験はundoに頼らずファイルレベルのコピー上で行うこと
+- `undo` — 接続済みアプリの直近の操作を取り消す(`application.Undo`)。dry-runは取り消し可能性があるか(`application.Undoable`)を返す。アプリ別の実測状態:PowerPointは呼べる、WordはこのビルドでUndo呼び出し自体が失敗する(エラーにUIのCtrl+Zへの案内が入る)、Excelは未検証——危険な実験はundoに頼らずファイルレベルのコピーまたは白紙克隆文書上で行うこと
 - `excel.active_sheet` — `/set-property`経由で変更
 
 書き込み操作は`dry_run`に対応し、dry_run以外は`confirm`を要求します。プロパティ変更にも`confirm`が必要です。実行した書き込みの結果には`unsaved_changes`(未保存の変更があるか)が付くので、エージェントはユーザーにOfficeで保存するよう伝えられます。
