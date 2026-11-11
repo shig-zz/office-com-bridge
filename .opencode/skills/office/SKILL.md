@@ -94,6 +94,14 @@ office undo --yes --expected-document "Deck.pptx"
 
 Never use undo to quietly clean up a failed write without the user's approval.
 
+`undoable` comes from `application.Undoable`. When the application does not
+expose it (this PowerPoint build returns `null`), dry-run cannot tell you
+whether anything is undoable. Only an explicit `undoable: false` makes
+`undo --yes` a safe no-op (`executed: false` with a note); with `null` the undo
+call always runs, and if Office had nothing to undo it still reports success
+without changing anything. When `undoable` is `null`, read the affected content
+back after the undo instead of trusting `executed: true`.
+
 Excel literal values:
 
 ```text
@@ -292,9 +300,11 @@ expressions. On this Office build the object model behaves as follows:
   reads them back and returns `verified`.
 - Delete a slide with `powerpoint slide delete <n>` (write workflow applies).
   Dry-run reports the `slide_title` of the slide that would be removed — read it
-  back to the user and confirm that exact slide, because the bridge cannot undo
-  the delete for them (they can in PowerPoint). The run verifies the slide count
-  dropped by one.
+  back to the user and confirm that exact slide. The run verifies the slide count
+  dropped by one. The delete can then be rolled back with `office undo --yes`,
+  but only while the delete is still Office's most recent action and only after
+  the user approves the undo, so confirm the slide up front rather than counting
+  on undo.
 - Check the autofit before appending a paragraph to an existing placeholder: one
   set to shrink text on overflow shrinks *every* line in that placeholder. Put the
   addition in its own text box in a free band instead; `powerpoint slides read`

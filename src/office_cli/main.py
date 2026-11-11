@@ -902,7 +902,7 @@ def powerpoint_slide_delete(
         help="Refuse to write unless the attached document matches this name.",
     ),
 ) -> None:
-    """Delete a slide. This cannot be undone through the bridge; confirm first."""
+    """Delete a slide. Rollback needs 'office undo' before any further action; confirm first."""
     params: dict[str, Any] = {"slide": slide, "dry_run": dry_run}
     if expected_document:
         params["expected_document"] = expected_document

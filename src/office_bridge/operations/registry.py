@@ -591,8 +591,9 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "description": (
                     "Delete one slide by 1-based number. Dry-run reports the title "
                     "of the slide that would be removed; the run verifies the "
-                    "slide count dropped by one. This cannot be undone through "
-                    "the bridge: ask the user to confirm the exact slide."
+                    "slide count dropped by one. Only rollbackable with 'undo' "
+                    "while the delete is still the most recent Office action, so "
+                    "ask the user to confirm the exact slide up front."
                 ),
                 "requires_confirmation": True,
                 "params": {
