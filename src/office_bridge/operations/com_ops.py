@@ -45,11 +45,82 @@ def _com_value(value: Any) -> Any:
 
     A two-dimensional array of sequences (list or tuple of list/tuple) is passed to COM as the
     tuple-of-tuples shape the object model expects (as used by excel.range.write). Scalars,
-    booleans, plain numbers and 1-D value arrays are returned unchanged.
+    booleans and plain numbers are returned unchanged; array-shaped values for Range
+    targets are validated and reshaped first by _normalize_array_value.
     """
     if isinstance(value, (list, tuple)) and value and all(isinstance(row, (list, tuple)) for row in value):
         return tuple(tuple(row) for row in value)
     return value
+
+
+def _range_dimensions(owner: Any) -> tuple[int, int] | None:
+    """Return the (rows, columns) of a Range-shaped object, else None."""
+    try:
+        rows = int(owner.Rows.Count)
+        columns = int(owner.Columns.Count)
+    except Exception:
+        return None
+    if rows < 1 or columns < 1:
+        return None
+    return rows, columns
+
+
+def _normalize_array_value(owner: Any, name: str, value: Any) -> Any:
+    """Shape array values to the Range that receives them before a COM set.
+
+    Excel does not reject a mismatched Variant array: it coerces it. A flat
+    list assigned to a multi-cell Range becomes a one-row array, the leading
+    cells receive the items, and the remaining cells are cleared silently.
+    When the assignment target is a Range, validate the array against the
+    Range's dimensions and convert matching flat lists (a single row's or a
+    single column's worth of values) into the two-dimensional shape Excel
+    expects, so partial silent writes cannot happen.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return value
+    dims = _range_dimensions(owner)
+    if dims is None:
+        return value
+    rows, columns = dims
+    if all(isinstance(item, (list, tuple)) for item in value):
+        widths = sorted({len(item) for item in value})
+        if len(value) == rows and widths == [columns]:
+            if rows == 1 and columns == 1:
+                return value[0][0]
+            return tuple(tuple(row) for row in value)
+        raise BridgeError(
+            ErrorCode.SIZE_MISMATCH,
+            f"The array assigned to {name!r} is {len(value)}x{'/'.join(str(w) for w in widths)} "
+            f"but the range is {rows}x{columns}. Pass an array that matches the range.",
+            400,
+            {
+                "property": name,
+                "range_rows": rows,
+                "range_columns": columns,
+                "array_rows": len(value),
+                "array_widths": widths,
+            },
+        )
+    if len(value) == 1:
+        # A single item means "this value everywhere"; Excel's scalar
+        # assignment fills every cell of the range.
+        return value[0]
+    if rows == 1 and len(value) == columns:
+        return (tuple(value),)
+    if columns == 1 and len(value) == rows:
+        return tuple((item,) for item in value)
+    raise invalid_request(
+        f"The flat array assigned to {name!r} has {len(value)} items but the range is "
+        f"{rows}x{columns}. Excel would write only the leading cells and clear the rest. "
+        "Pass a two-dimensional array of rows x columns, or a flat array of exactly one "
+        "row's or one column's worth of values.",
+        {
+            "property": name,
+            "items": len(value),
+            "range_rows": rows,
+            "range_columns": columns,
+        },
+    )
 
 _BLOCKED_PREFIXES = ("save", "close")
 _BLOCKED_NAMES = ("quit", "exit")
@@ -169,6 +240,8 @@ def execute(
         if not callable(member):
             raise invalid_request(f"Member {last.name!r} is not a method.")
         call_args, resolved_notes = _resolve_placement_arguments(target, owner, last)
+        call_args, anchor_notes = _resolve_hyperlink_anchor(target, segments, owner, last, call_args)
+        resolved_notes = resolved_notes + anchor_notes
         if dry_run:
             preview = {
                 "mode": "call",
@@ -198,6 +271,7 @@ def execute(
         return payload
 
     owner = _walk(root_object, segments[:-1])
+    value = _normalize_array_value(owner, last.name, value)
     com_value = _com_value(value)
     if dry_run:
         member = _member(owner, last.name)
@@ -450,3 +524,40 @@ def _resolve_placement_arguments(
             sheet_name = None
         notes.append({"position": position, "argument": jsonable(arg), "sheet": sheet_name})
     return tuple(resolved), notes
+
+
+def _resolve_hyperlink_anchor(
+    target: ResolvedTarget,
+    segments: list[Segment],
+    owner: Any,
+    last: Segment,
+    args: tuple[Any, ...],
+) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+    """Give Excel's Hyperlinks.Add the Anchor object its caller cannot pass.
+
+    Hyperlinks.Add takes the linked Range as its first (Anchor) parameter, but
+    com call arguments are JSON literals, so a Range object can never reach
+    it and the call fails with a type mismatch. The Hyperlinks collection's
+    Parent is exactly the Range that owns it, so for a call walked through a
+    'Hyperlinks.Add' on a Range-scoped collection the anchor is prepended.
+    Collections whose parent is not a Range (for example a Worksheet's
+    Hyperlinks) are left alone so Excel reports the missing anchor itself.
+    """
+    if (
+        target.app is not AppKind.EXCEL
+        or len(segments) < 2
+        or segments[-2].name.lower() != "hyperlinks"
+        or last.name.lower() != "add"
+    ):
+        return args, []
+    try:
+        anchor = owner.Parent
+        anchor_address = str(anchor.Address)
+    except Exception:
+        return args, []
+    note: dict[str, Any] = {"position": 0, "anchor": anchor_address}
+    try:
+        note["sheet"] = jsonable(anchor.Parent.Name)
+    except Exception:
+        pass
+    return (anchor,) + args, [note]

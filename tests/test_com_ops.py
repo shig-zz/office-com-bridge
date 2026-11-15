@@ -198,14 +198,108 @@ def test_set_value2_2d_array_is_passed_as_tuple_of_tuples() -> None:
     assert range_node.sets == {"Value2": ((1, 2), (3, 4))}
 
 
-def test_set_value2_1d_array_is_passed_unchanged() -> None:
-    range_node = Node("range", {"Value2": None})
+def test_set_value2_flat_array_for_one_row_is_reshaped() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=1),
+            "Columns": SimpleNamespace(Count=2),
+        },
+    )
     sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
     window = Node("window", {"ActiveSheet": sheet})
     target = make_target(window=window)
     result = run("set", 'ActiveSheet.Range("A1:B1").Value2', target, value=[5, 6], confirm=True)
     assert result["applied"] is True
-    assert range_node.sets == {"Value2": [5, 6]}
+    assert range_node.sets == {"Value2": ((5, 6),)}
+
+
+def test_set_value2_flat_array_for_one_column_is_reshaped() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=3),
+            "Columns": SimpleNamespace(Count=1),
+        },
+    )
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("E58:E60").Value2', target, value=["a", "b", "c"], confirm=True)
+    assert result["applied"] is True
+    assert range_node.sets == {"Value2": (("a",), ("b",), ("c",))}
+
+
+def test_set_value2_single_item_array_fills_range_with_scalar() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=3),
+            "Columns": SimpleNamespace(Count=1),
+        },
+    )
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("E58:E60").Value2', target, value=["同一"], confirm=True)
+    assert result["applied"] is True
+    assert range_node.sets == {"Value2": "同一"}
+
+
+def test_set_value2_flat_array_with_wrong_length_is_rejected() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=3),
+            "Columns": SimpleNamespace(Count=1),
+        },
+    )
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    with pytest.raises(BridgeError) as excinfo:
+        run("set", 'ActiveSheet.Range("E58:E60").Value2', target, value=[1, 2, 3, 4], confirm=True)
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    assert range_node.sets == {}
+
+
+def test_set_value2_nested_array_with_wrong_shape_is_rejected() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=3),
+            "Columns": SimpleNamespace(Count=1),
+        },
+    )
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    with pytest.raises(BridgeError) as excinfo:
+        run("set", 'ActiveSheet.Range("E58:E60").Value2', target, value=[[1, 2], [3, 4], [5, 6]], confirm=True)
+    assert excinfo.value.code == ErrorCode.SIZE_MISMATCH
+    assert range_node.sets == {}
+
+
+def test_set_value2_nested_single_cell_is_unwrapped() -> None:
+    range_node = Node(
+        "range",
+        {
+            "Value2": None,
+            "Rows": SimpleNamespace(Count=1),
+            "Columns": SimpleNamespace(Count=1),
+        },
+    )
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("A1").Value2', target, value=[[7]], confirm=True)
+    assert result["applied"] is True
+    assert range_node.sets == {"Value2": 7}
 
 
 def test_set_single_segment_uses_root_directly() -> None:
@@ -553,3 +647,77 @@ def test_call_unsaved_state_unknown_when_unreadable() -> None:
     target = make_target(document=document)
     result = run("call", "Reorder()", target, root="document", confirm=True)
     assert result["unsaved_changes"] is None
+
+
+def make_hyperlink_target() -> tuple[SimpleNamespace, Node, Node]:
+    """window.ActiveSheet.Range("E57").Hyperlinks chain with a Range parent."""
+
+    sheet = Node("sheet", {"Name": "Data"})
+    range_node = Node("range", {"Address": "$E$57:$E$60", "Parent": sheet})
+    add = Node("Add")
+    hyperlinks = Node("hyperlinks", {"Add": add, "Parent": range_node})
+    range_node._members["Hyperlinks"] = hyperlinks
+    range_lookup = Node("Range", call_result=range_node)
+    window = Node("window", {"ActiveSheet": Node("activesheet", {"Range": range_lookup})})
+    return make_target(window=window), add, range_node
+
+
+def test_call_hyperlinks_add_prepends_range_anchor() -> None:
+    target, add, range_node = make_hyperlink_target()
+    result = run(
+        "call",
+        'ActiveSheet.Range("E57:E60").Hyperlinks.Add("https://example.com")',
+        target,
+        confirm=True,
+    )
+    assert result["executed"] is True
+    assert add.calls == [(range_node, "https://example.com")]
+    assert result["resolved_arguments"] == [
+        {"position": 0, "anchor": "$E$57:$E$60", "sheet": "Data"}
+    ]
+
+
+def test_call_hyperlinks_add_dry_run_reports_anchor_without_calling() -> None:
+    target, add, _ = make_hyperlink_target()
+    result = run(
+        "call",
+        'ActiveSheet.Range("E57").Hyperlinks.Add("https://example.com")',
+        target,
+        dry_run=True,
+    )
+    assert result["executed"] is False
+    assert add.calls == []
+    assert result["resolved_arguments"][0]["anchor"] == "$E$57:$E$60"
+
+
+def test_call_hyperlinks_add_keeps_extra_arguments_after_anchor() -> None:
+    target, add, range_node = make_hyperlink_target()
+    run(
+        "call",
+        'ActiveSheet.Range("E57").Hyperlinks.Add("https://example.com", "Sheet2!A1", "tip")',
+        target,
+        confirm=True,
+    )
+    assert add.calls == [(range_node, "https://example.com", "Sheet2!A1", "tip")]
+
+
+def test_call_hyperlinks_add_not_injected_for_non_excel_target() -> None:
+    target, add, _ = make_hyperlink_target()
+    target.app = AppKind.WORD
+    run(
+        "call",
+        'ActiveSheet.Range("E57").Hyperlinks.Add("https://example.com")',
+        target,
+        confirm=True,
+    )
+    assert add.calls == [("https://example.com",)]
+
+
+def test_call_hyperlinks_add_skipped_when_parent_is_not_a_range() -> None:
+    workbook_sheet = Node("sheet", {"Name": "Data"})
+    add = Node("Add")
+    hyperlinks = Node("hyperlinks", {"Add": add, "Parent": workbook_sheet})
+    window = Node("window", {"ActiveSheet": Node("activesheet", {"Hyperlinks": hyperlinks})})
+    target = make_target(window=window)
+    run("call", 'ActiveSheet.Hyperlinks.Add("https://example.com")', target, confirm=True)
+    assert add.calls == [("https://example.com",)]

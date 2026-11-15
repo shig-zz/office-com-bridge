@@ -118,11 +118,21 @@ class FakeRange:
 
 
 class FakeSheet:
-    def __init__(self, ranges: dict[str, FakeRange]) -> None:
+    def __init__(self, ranges: dict[str, FakeRange], name: str = "Sheet1") -> None:
         self._ranges = ranges
+        self.Name = name
 
     def Range(self, address: str) -> FakeRange:
         return self._ranges[address]
+
+
+class FakeWorksheets:
+    def __init__(self, sheets: list[FakeSheet]) -> None:
+        self._sheets = sheets
+        self.Count = len(sheets)
+
+    def __call__(self, index: int) -> FakeSheet:
+        return self._sheets[index - 1]
 
 
 class FakeWindow:
@@ -173,6 +183,59 @@ def test_single_cell_is_wrapped_in_a_matrix() -> None:
     target = make_target(FakeWindow(target_range, {"A1": target_range}))
     result = excel.read_range(target, address="A1", include_formulas=False, max_cells=10)
     assert result["values"] == [["hello"]]
+
+
+def test_read_range_uses_named_sheet_when_given() -> None:
+    active_range = FakeRange(1, 1, "active", address="A1")
+    data_range = FakeRange(1, 1, "from-data", address="A1")
+    data_sheet = FakeSheet({"A1": data_range}, name="Data")
+    target = make_target(FakeWindow(active_range, {"A1": active_range}))
+    target.document = SimpleNamespace(Worksheets=FakeWorksheets([data_sheet]))
+    result = excel.read_range(
+        target, address="A1", include_formulas=False, max_cells=10, sheet_name="Data"
+    )
+    assert result["values"] == [["from-data"]]
+
+
+def test_write_range_targets_named_sheet() -> None:
+    active_range = FakeRange(2, 1, None, address="A1:A2")
+    data_range = FakeRange(2, 1, None, address="A1:A2")
+    data_sheet = FakeSheet({"A1:A2": data_range}, name="Data")
+    target = make_target(FakeWindow(active_range, {"A1:A2": active_range}))
+    target.document = SimpleNamespace(Worksheets=FakeWorksheets([data_sheet]))
+    excel.write_range(
+        target,
+        address="A1:A2",
+        values=[["x"], ["y"]],
+        dry_run=False,
+        max_cells=10,
+        params={"confirm": True},
+        sheet_name="Data",
+    )
+    assert data_range.written == (("x",), ("y",))
+    assert active_range.written is None
+
+
+def test_range_rejects_unknown_sheet_name() -> None:
+    active_range = FakeRange(1, 1, "active", address="A1")
+    other = FakeSheet({}, name="Data")
+    target = make_target(FakeWindow(active_range, {"A1": active_range}))
+    target.document = SimpleNamespace(Worksheets=FakeWorksheets([other]))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.read_range(
+            target, address="A1", include_formulas=False, max_cells=10, sheet_name="Nope"
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+
+
+def test_range_rejects_non_string_sheet_name() -> None:
+    active_range = FakeRange(1, 1, "active", address="A1")
+    target = make_target(FakeWindow(active_range, {"A1": active_range}))
+    with pytest.raises(BridgeError) as excinfo:
+        excel.read_range(
+            target, address="A1", include_formulas=False, max_cells=10, sheet_name=2
+        )
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
 
 
 def test_read_range_rejects_large_ranges() -> None:

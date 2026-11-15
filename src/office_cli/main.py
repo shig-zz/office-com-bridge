@@ -510,9 +510,14 @@ def excel_range_read(
     formulas: bool = typer.Option(
         False, "--formulas", help="Include formula strings alongside values."
     ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
+    ),
 ) -> None:
-    """Read a range from the active sheet of the attached workbook."""
+    """Read a range from a sheet of the attached workbook (default: active sheet)."""
     params = {"address": address, "include_formulas": formulas}
+    if sheet:
+        params["sheet"] = sheet
     _run(ctx, lambda client: client.inspect("excel.range", params))
 
 
@@ -525,6 +530,9 @@ def excel_range_write(
     ),
     json_file: Path = typer.Option(
         None, "--file", help="Path to a JSON file containing a two-dimensional array."
+    ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Validate the range and array without writing."
@@ -545,6 +553,8 @@ def excel_range_write(
         "values": values,
         "dry_run": dry_run,
     }
+    if sheet:
+        params["sheet"] = sheet
     if expected_document:
         params["expected_document"] = expected_document
 
@@ -575,6 +585,9 @@ def excel_range_copy_format(
     address: str = typer.Argument(
         ..., help="Target range that receives the formatting (same dimensions)."
     ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name for both ranges; defaults to the active sheet."
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Validate the ranges without changing formatting."
     ),
@@ -598,6 +611,8 @@ def excel_range_copy_format(
         "address": address,
         "dry_run": dry_run,
     }
+    if sheet:
+        params["sheet"] = sheet
     if borders:
         params["borders"] = True
     if expected_document:
@@ -625,6 +640,9 @@ def excel_range_copy_format(
 def excel_range_set_format(
     ctx: typer.Context,
     address: str = typer.Argument(..., help="A1-style range, for example A1:B2."),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
+    ),
     font_name: str = typer.Option(
         None,
         "--font-name",
@@ -657,6 +675,8 @@ def excel_range_set_format(
 ) -> None:
     """Set explicit formatting properties on an Excel range."""
     params: dict[str, Any] = {"address": address, "dry_run": dry_run}
+    if sheet:
+        params["sheet"] = sheet
     if font_name is not None:
         params["font_name"] = font_name
     if font_size is not None:
@@ -681,7 +701,7 @@ def excel_range_set_format(
         params["border"] = border
     if border_color is not None:
         params["border_color"] = border_color
-    if len(params) <= 2:
+    if not any(key not in {"address", "dry_run", "sheet"} for key in params):
         raise typer.BadParameter(
             "Provide at least one formatting option "
             "(--font-name, --font-size, --bold, --italic, --color, --number-format, "
@@ -713,6 +733,9 @@ def excel_range_set_format(
 def excel_range_add_hyperlink(
     ctx: typer.Context,
     address: str = typer.Argument(..., help="A1-style range, for example E35."),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
+    ),
     url: str = typer.Option(
         ...,
         "--url",
@@ -740,6 +763,8 @@ def excel_range_add_hyperlink(
 ) -> None:
     """Add a hyperlink object to an Excel range (or update the existing one)."""
     params: dict[str, Any] = {"address": address, "url": url, "dry_run": dry_run}
+    if sheet:
+        params["sheet"] = sheet
     if sub_address is not None:
         params["sub_address"] = sub_address
     if screen_tip is not None:
@@ -770,6 +795,9 @@ def excel_range_sort(
     ctx: typer.Context,
     address: str = typer.Argument(
         ..., help="A1-style range to sort, for example A2:E54 (exclude header rows)."
+    ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
     ),
     column: list[str] = typer.Option(
         ...,
@@ -810,6 +838,8 @@ def excel_range_sort(
             key["order"] = order[index].lower()
         keys.append(key)
     params: dict[str, Any] = {"address": address, "keys": keys, "dry_run": dry_run}
+    if sheet:
+        params["sheet"] = sheet
     if expected_document:
         params["expected_document"] = expected_document
 
@@ -820,7 +850,9 @@ def excel_range_sort(
                 if not _confirm_write(
                     ctx,
                     client,
-                    f"sort the rows of {address} by "
+                    f"sort the rows of {address}"
+                    + (f" on sheet {sheet!r}" if sheet else "")
+                    + " by "
                     + ", ".join(
                         f"{key['column']} {key.get('order', 'ascending')}" for key in keys
                     ),
@@ -845,11 +877,16 @@ def excel_range_read_format(
         "--borders",
         help="Include per-side border style, weight and color.",
     ),
+    sheet: str = typer.Option(
+        None, "--sheet", help="Sheet name; defaults to the active sheet."
+    ),
 ) -> None:
     """Read cell formatting (fill, font, number format) with RRGGBB colors."""
     params: dict[str, Any] = {"address": address}
     if borders:
         params["borders"] = True
+    if sheet:
+        params["sheet"] = sheet
     _run(ctx, lambda client: client.inspect("excel.range.format", params))
 
 

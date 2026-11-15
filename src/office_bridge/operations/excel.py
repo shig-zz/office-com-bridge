@@ -171,9 +171,10 @@ def _range_error(exc: pywintypes.com_error) -> BridgeError:
     )
 
 
-def _range(target: ResolvedTarget, address: str) -> Any:
+def _range(target: ResolvedTarget, address: str, sheet_name: Any = None) -> Any:
+    """Resolve an A1 range on a named sheet, defaulting to the active sheet."""
+    sheet = _worksheet_by_name(target, sheet_name)
     try:
-        sheet = target.window.ActiveSheet
         return sheet.Range(address)
     except pywintypes.com_error as exc:
         raise _range_error(exc) from exc
@@ -190,8 +191,9 @@ def read_range(
     address: str,
     include_formulas: bool,
     max_cells: int,
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     try:
         areas_count = int(range_object.Areas.Count)
     except Exception:
@@ -279,6 +281,7 @@ def write_range(
     dry_run: bool,
     max_cells: int,
     params: dict[str, Any],
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
     check_expected_document(target, params)
     matrix, rows, columns = validate_matrix(values)
@@ -294,7 +297,7 @@ def write_range(
                     {"address": address},
                 )
 
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     try:
         actual_rows = int(range_object.Rows.Count)
         actual_columns = int(range_object.Columns.Count)
@@ -350,10 +353,11 @@ def copy_format(
     max_cells: int,
     params: dict[str, Any],
     include_borders: bool = False,
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
     check_expected_document(target, params)
-    source = _range(target, source_address)
-    dest = _range(target, address)
+    source = _range(target, source_address, sheet_name)
+    dest = _range(target, address, sheet_name)
     source_dims = _dims(source)
     dest_dims = _dims(dest)
     if source_dims != dest_dims:
@@ -436,9 +440,10 @@ def set_format(
     dry_run: bool,
     max_cells: int,
     params: dict[str, Any],
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
     check_expected_document(target, params)
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     rows, columns = _dims(range_object)
     check_cell_limit(rows * columns, max_cells)
 
@@ -550,6 +555,7 @@ def add_hyperlink(
     dry_run: bool,
     max_cells: int,
     params: dict[str, Any],
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
     check_expected_document(target, params)
     url = require_str(params, "url")
@@ -582,7 +588,7 @@ def add_hyperlink(
             {"parameter": "sub_address"},
         )
 
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     rows, columns = _dims(range_object)
     check_cell_limit(rows * columns, max_cells)
 
@@ -754,6 +760,7 @@ def sort_range(
     dry_run: bool,
     max_cells: int,
     params: dict[str, Any],
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
     """Sort the rows of a range in place.
 
@@ -774,7 +781,7 @@ def sort_range(
             {"parameter": "keys"},
         )
 
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     try:
         rows, columns = _dims(range_object)
         top_row = int(range_object.Row)
@@ -814,6 +821,12 @@ def sort_range(
 
     sheet = range_object.Parent
     try:
+        if sheet_name is not None:
+            # Row moves use clipboard-backed primitives; keep the proven path by
+            # working on the active sheet, like excel.rows.move does.
+            active = target.window.ActiveSheet
+            if _sheet_name(active).lower() != _sheet_name(sheet).lower():
+                sheet.Activate()
         # Read heights per row: Range.RowHeight is unreliable in this build (it can
         # return None or a scalar for multi-row ranges), while Rows(n).RowHeight works.
         heights: list[float | None] = []
@@ -845,7 +858,7 @@ def sort_range(
         # Re-resolve the range for the verification read: in this build a Range object
         # obtained before the row moves shrinks as rows are deleted, so reading through
         # it would return fewer rows than the range actually holds.
-        final_range = _range(target, address)
+        final_range = _range(target, address, sheet_name)
         final_values = _rectangular(_matrix(final_range.Value2, rows, columns), rows, columns)
     except pywintypes.com_error as exc:
         raise _range_error(exc) from exc
@@ -1063,12 +1076,14 @@ def _positive_int(value: Any, parameter: str) -> int:
     return value
 
 
-def _worksheet_by_name(target: ResolvedTarget, sheet_name: str | None) -> Any:
+def _worksheet_by_name(target: ResolvedTarget, sheet_name: Any) -> Any:
     if sheet_name is None:
         try:
             return target.window.ActiveSheet
         except pywintypes.com_error as exc:
             raise _range_error(exc) from exc
+    if not isinstance(sheet_name, str) or not sheet_name.strip():
+        raise invalid_request("Parameter 'sheet' must be a sheet name.", {"parameter": "sheet"})
     workbook = target.document
     try:
         for index in range(1, int(workbook.Worksheets.Count) + 1):
@@ -1304,8 +1319,9 @@ def read_format(
     address: str,
     max_cells: int,
     include_borders: bool = False,
+    sheet_name: Any = None,
 ) -> dict[str, Any]:
-    range_object = _range(target, address)
+    range_object = _range(target, address, sheet_name)
     rows, columns = _dims(range_object)
     check_cell_limit(rows * columns, max_cells)
     try:

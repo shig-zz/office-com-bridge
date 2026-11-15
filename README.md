@@ -97,6 +97,7 @@ office excel range copy-format A1:B2 C1:D2 --borders --yes
 office excel range set-format A1:B2 --font-name "MS Gothic" --font-size 11 --halign center --yes
 office excel range read-format A1:B2 --borders
 office excel range add-hyperlink E35 --url "https://example.com/" --yes
+office excel range read A1:B2 --sheet "Sheet2"
 office excel rows insert "2:4" --yes
 office excel rows delete 61 --yes
 office excel rows move 61 --to 60 --yes

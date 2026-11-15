@@ -295,6 +295,109 @@ def test_add_hyperlink_with_yes_sends_confirm(monkeypatch) -> None:
     assert params["expected_document"] == "Book1.xlsx"
 
 
+def test_range_read_named_sheet_inspects(monkeypatch) -> None:
+    client = FakeClient()
+    inspections: list[tuple[str, dict[str, Any]]] = []
+
+    def inspect(kind, params=None):
+        inspections.append((kind, params or {}))
+        return {"ok": True, "context": None, "result": {"kind": kind}}
+
+    client.inspect = inspect
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["excel", "range", "read", "A1:D5", "--sheet", "気になっている作品"]
+    )
+    assert result.exit_code == 0
+    kind, params = inspections[0]
+    assert kind == "excel.range"
+    assert params["address"] == "A1:D5"
+    assert params["sheet"] == "気になっている作品"
+
+
+def test_range_write_named_sheet_sends_sheet_param(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "excel",
+            "range",
+            "write",
+            "A1:B1",
+            "--json",
+            "[[1, 2]]",
+            "--sheet",
+            "Data",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.write"
+    assert params["sheet"] == "Data"
+    assert params["dry_run"] is True
+
+
+def test_range_copy_format_named_sheet_sends_sheet_param(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["excel", "range", "copy-format", "A55:E55", "A57:E57", "--sheet", "Data", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.copy_format"
+    assert params["sheet"] == "Data"
+
+
+def test_range_add_hyperlink_named_sheet_sends_sheet_param(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "excel",
+            "range",
+            "add-hyperlink",
+            "E57",
+            "--url",
+            "https://example.com",
+            "--sheet",
+            "Data",
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.add_hyperlink"
+    assert params["sheet"] == "Data"
+
+
+def test_range_sort_named_sheet_sends_sheet_param(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["excel", "range", "sort", "A38:E60", "--column", "C", "--sheet", "Data", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "excel.range.sort"
+    assert params["sheet"] == "Data"
+
+
+def test_range_set_format_sheet_alone_is_not_a_format_option(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["excel", "range", "set-format", "A1", "--sheet", "Data"]
+    )
+    assert result.exit_code == 2
+    assert client.invocations == []
+
+
 def test_word_insert_requires_text(monkeypatch) -> None:
     client = FakeClient()
     install_client(monkeypatch, client)

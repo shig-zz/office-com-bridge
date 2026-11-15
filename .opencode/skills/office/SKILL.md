@@ -23,21 +23,26 @@ The `office` CLI talks to a localhost bridge. The user registers the Office docu
 
 `office context` still reports the last captured target (with its `target_id`); use it for single-document sessions. Run `office capabilities` when you need the exact operation names, the general-operation syntax, the blocklist, or the limits. Never invent operations, COM method names, or command flags.
 
-## The active sheet
+## The active sheet and `--sheet`
 
-In Excel, every operation that takes an A1 address — `range read`, `range write`,
-`range sort`, `range add-hyperlink`, the formatting commands, and `com` expressions
-rooted at `window` such as `ActiveSheet.Range(...)` or `Rows(...)` — acts on the
-workbook's **active sheet**, not on a sheet you name. The same address means
-different things on different sheets, and a write aimed at one sheet lands on
-another when the active sheet is wrong.
+Every curated Excel command that takes an A1 address — `range read`,
+`range read-format`, `range write`, `range copy-format`, `range set-format`,
+`range sort`, `range add-hyperlink` — works on the workbook's **active sheet**
+by default. Pass `--sheet "<name>"` to address a named sheet directly without
+switching it; the name is matched case-insensitively and an unknown name is
+rejected before anything is read or written. Prefer `--sheet` whenever the task
+names a sheet: the same address means different things on different sheets, and
+without it a write aimed at one sheet lands on another when the active sheet is
+wrong.
 
 - After every (re)attach, check the active sheet before any Excel write:
   `office --target <id> excel workbook inspect` (field `active_sheet`) or
   `office context` (field `sheet`).
-- To work on another sheet, switch it with the normal write workflow (include the
-  switch in the change you describe when asking for approval), then switch back
-  when done:
+- Commands that follow the window rather than an address — `inspect selection`,
+  and `com` expressions rooted at `window` such as `ActiveSheet.Range(...)` or
+  `Rows(...)` — always follow the active sheet. To work there on another sheet,
+  switch it with the normal write workflow (include the switch in the change you
+  describe when asking for approval), then switch back when done:
 
   ```text
   office set-property excel.active_sheet --value "気になっている作品" --yes --expected-document "MovieLog.xlsx"
@@ -57,6 +62,7 @@ Prefer the narrowest read that answers the question. The examples below omit
 | Current selection (any app) | `office inspect selection` |
 | Current document summary | `office inspect document` |
 | Excel range values | `office excel range read "A1:D20"` |
+| Excel range values from a named sheet | `office excel range read "A1:D20" --sheet "気になっている作品"` |
 | Excel range values and formulas | `office excel range read "A1:D20" --formulas` |
 | Excel cell formatting (fill, font, borders) | `office excel range read-format "A1:D20" --borders` |
 | Excel workbook and sheet names | `office excel workbook inspect` |
@@ -182,6 +188,8 @@ Rules for Excel writes:
 
 - Write literal values only. Formula strings beginning with `=` are rejected.
 - The array dimensions must exactly match the target range.
+- Pass `--sheet "<name>"` when the task names a sheet; the write lands on that
+  sheet without switching it.
 - Use `--dry-run` first. The written values are not a substitute for the user's confirmation.
 - Prefer small, reversible changes. Do not clear whole rows, columns, or used ranges unless the user explicitly asked and confirmed the exact range.
 
@@ -294,11 +302,14 @@ office excel range add-hyperlink "E35" --url "https://example.com/" --yes --expe
 - If the range already has a hyperlink, its address is updated instead of
   adding a duplicate (the operation is idempotent).
 - `--sub-address` sets the anchor or a sheet reference (for example
-  `Sheet2!A1`); `--screen-tip` sets the tooltip.
-- Do not try to create hyperlinks through `office com`: `Hyperlinks.Add` needs
-  the range object itself as an argument, and general `call` arguments are
-  literals only (the sheet placement arguments of `Add`/`Copy`/`Move` are the
-  one resolved exception — see "General operations").
+  `Sheet2!A1`); `--screen-tip` sets the tooltip. `--sheet` names the sheet.
+- Hyperlinks can also go through `office com`: although `call` arguments are
+  literals only and `Hyperlinks.Add` needs the Range object as its first
+  (Anchor) parameter, the bridge auto-completes the anchor for a
+  `...Range(...).Hyperlinks.Add("https://...")` expression — the owning Range is
+  taken from the expression itself and reported as `resolved_arguments` in
+  dry-run previews and executed calls. Pass only `Address`, optional
+  `SubAddress`, and `ScreenTip`.
 
 Excel row sorting:
 
@@ -568,7 +579,13 @@ office com set 'window.Selection.Font.Bold' --value true
 - `com get EXPR` — read a property (no confirmation). EXPR ends with a property name.
 - `com call EXPR` — call a method (write workflow applies). EXPR ends with `(arguments)`. The result carries `result_type`, the real type name of the returned value (`Boolean`, `Nothing`, `Presentation`...), so a stringified COM object is never mistaken for a scalar of the same printed form.
 - `com set EXPR --value V` — set a property (write workflow applies). EXPR ends with a property name. V is JSON (`42`, `true`, `"text"`, `[[1,2],[3,4]]`) or a plain string.
-  - A two-dimensional value array for `Value2` (for example `[[1,2],[3,4]]`) is passed to COM as a tuple of tuples (the same shape `excel.range.write` uses), so it lands in the individual cells correctly. Scalars and one-dimensional arrays are passed through unchanged.
+  - Array values aimed at a Range (`Value2` and friends) are validated against
+    the range's dimensions: a two-dimensional array must match exactly
+    (`SIZE_MISMATCH` otherwise), a flat array of exactly one row's or one
+    column's worth is reshaped to fit, and a one-element array fills every
+    cell. A mismatched flat array is rejected instead of silently writing the
+    leading cells and clearing the rest — Excel coerces such arrays without an
+    error, so this guard is what keeps partial writes from happening.
   - `--value @path` reads the value from a UTF-8 file instead of the command line. Use it for long or multi-line text (especially Japanese) so shell quoting and code pages cannot corrupt it. `--replace @path` and `--text @path` on the PowerPoint commands work the same way.
   - String literals in expressions support `\n`, `\t`, `\r`, `\v` (vertical tab), `\/`, and `\uXXXX`, so PowerPoint paragraphs and soft line breaks can be written without putting raw control characters on the command line.
 - When a member name is rejected, `error.details.did_you_mean` lists the real member names on that object and `error.details.hint` suggests the standard substitute. Use them; do not guess more names.

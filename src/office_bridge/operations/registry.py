@@ -50,6 +50,7 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             address=address,
             include_formulas=include_formulas,
             max_cells=settings.max_cells,
+            sheet_name=params.get("sheet"),
         )
 
     if kind == "excel.range.format":
@@ -60,6 +61,7 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             address=address,
             max_cells=settings.max_cells,
             include_borders=optional_bool(params, "borders", False),
+            sheet_name=params.get("sheet"),
         )
 
     if kind in {"excel.workbook", "word.document", "powerpoint.document"}:
@@ -152,6 +154,7 @@ def _invoke(
             dry_run=dry_run,
             max_cells=settings.max_cells,
             params=params,
+            sheet_name=params.get("sheet"),
         )
 
     if operation == "word.selection.insert_text":
@@ -182,6 +185,7 @@ def _invoke(
             max_cells=settings.max_cells,
             params=params,
             include_borders=optional_bool(params, "borders", False),
+            sheet_name=params.get("sheet"),
         )
 
     if operation == "excel.range.set_format":
@@ -194,6 +198,7 @@ def _invoke(
             dry_run=dry_run,
             max_cells=settings.max_cells,
             params=params,
+            sheet_name=params.get("sheet"),
         )
 
     if operation == "excel.range.add_hyperlink":
@@ -206,6 +211,7 @@ def _invoke(
             dry_run=dry_run,
             max_cells=settings.max_cells,
             params=params,
+            sheet_name=params.get("sheet"),
         )
 
     if operation == "excel.range.sort":
@@ -221,6 +227,7 @@ def _invoke(
             dry_run=dry_run,
             max_cells=settings.max_cells,
             params=params,
+            sheet_name=params.get("sheet"),
         )
 
     if operation in {
@@ -438,10 +445,11 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "name": "excel.range",
                 "applications": ["Excel"],
                 "mode": "read",
-                "description": "Read values (and optionally formulas) from an A1-style range on the window's active sheet.",
+                "description": "Read values (and optionally formulas) from an A1-style range on a named sheet, defaulting to the active sheet.",
                 "params": {
                     "address": {"type": "string", "required": True},
                     "include_formulas": {"type": "boolean", "required": False},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                 },
             },
             {
@@ -459,6 +467,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "address": {"type": "string", "required": True},
                     "borders": {"type": "boolean", "required": False},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                 },
             },
             {
@@ -560,6 +569,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "address": {"type": "string", "required": True},
                     "values": {"type": "array", "required": True, "items": "row arrays"},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},
@@ -633,6 +643,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "source_address": {"type": "string", "required": True},
                     "address": {"type": "string", "required": True},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name for both ranges; defaults to the active sheet."},
                     "borders": {"type": "boolean", "required": False},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
@@ -664,6 +675,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                         "note": "Anchor inside the destination or a sheet reference such as 'Sheet2!A1'.",
                     },
                     "screen_tip": {"type": "string", "required": False},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},
@@ -696,6 +708,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                             "an optional 'order' ('ascending' default or 'descending')."
                         ),
                     },
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                     "dry_run": {"type": "boolean", "required": False},
                     "expected_document": {"type": "string", "required": False},
                     "confirm": {"type": "boolean", "required": True},
@@ -806,6 +819,7 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "requires_confirmation": True,
                 "params": {
                     "address": {"type": "string", "required": True},
+                    "sheet": {"type": "string", "required": False, "note": "Sheet name; defaults to the active sheet."},
                     "font_name": {"type": "string", "required": False, "note": "Use a pan-CJK font (e.g. MS Gothic, Yu Gothic, Meiryo) to cover both Japanese and Western text."},
                     "font_size": {"type": "number", "required": False},
                     "bold": {"type": "boolean", "required": False},
