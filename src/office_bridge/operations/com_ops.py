@@ -20,9 +20,11 @@ from ..config import Settings
 from ..errors import (
     BridgeError,
     ErrorCode,
+    autofit_refused,
     com_error,
     invalid_request,
     operation_blocked,
+    text_frame_missing,
 )
 from ..target import AppKind, ResolvedTarget
 from .common import (
@@ -127,6 +129,38 @@ _BLOCKED_NAMES = ("quit", "exit")
 
 # IDispatch error codes for an unknown member name.
 _UNKNOWN_MEMBER_HRESULTS = {0x8002000B, 0x80020009, 0x80020027}
+
+# PowerPoint autofit members: setting them with a value outside the enum table is
+# refused by Office with a bare DISP_E_EXCEPTION, so the failure gets its own code.
+_AUTOFIT_PROPERTY_NAMES = ("autosize", "msoautofitbehavior", "fittext")
+
+_AUTOFIT_ENUMS = {
+    "TextFrame.AutoSize": {
+        "ppAutoSizeNone": 0,
+        "ppAutoSizeShapeToFitText": 1,
+        "ppAutoSizeMixed": -2,
+    },
+    "TextFrame2.AutoSize": {
+        "msoAutoSizeNone": 0,
+        "msoAutoSizeShapeToFitText": 1,
+        "msoAutoSizeTextToFitShape": 2,
+        "msoAutoSizeMixed": -2,
+    },
+}
+
+_AUTOFIT_HINT = (
+    "PowerPoint has two autofit members with two different enum tables: "
+    "TextFrame.AutoSize takes PpAutoSize (0 none, 1 shape fits text, -2 mixed) and cannot "
+    "express 'shrink text on overflow' at all, while TextFrame2.AutoSize takes MsoAutoSize "
+    "(0 none, 1 shape fits text, 2 text fits shape, -2 mixed). A value outside the table is "
+    "refused with an uninformative DISP_E_EXCEPTION. Prefer the curated "
+    "'office powerpoint text set-autofit SLIDE --shape N --behavior text' command, which "
+    "picks the right member and reads the result back; otherwise ask the user to set it in "
+    "the UI (Text Options > Autofit > Shrink text on overflow)."
+)
+
+# Members that only make sense on a shape that owns a text frame.
+_TEXT_FRAME_MEMBER_NAMES = ("textframe", "textframe2", "textrange", "textrange2", "text")
 
 
 def blocked_policy(settings: Settings) -> dict[str, Any]:
@@ -273,6 +307,7 @@ def execute(
     owner = _walk(root_object, segments[:-1])
     value = _normalize_array_value(owner, last.name, value)
     com_value = _com_value(value)
+    before = _read_before(owner, last.name, settings)
     if dry_run:
         member = _member(owner, last.name)
         preview = {
@@ -282,6 +317,7 @@ def execute(
             "applied": False,
             "property": last.name,
             "value": jsonable(com_value),
+            **before,
         }
         if callable(member):
             preview["applied_via"] = "parameterized_property"
@@ -291,21 +327,19 @@ def execute(
         setattr(owner, last.name, com_value)
     except (AttributeError, pywintypes.com_error) as exc:
         if not _is_unknown_member_error(exc):
-            raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+            raise _set_failure(last.name, com_value, exc) from exc
         # The name is not reachable as a plain property; some Office members are
         # parameterized properties and are set by calling them with the value.
         member = _member(owner, last.name)
         if not callable(member):
-            raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+            raise _set_failure(last.name, com_value, exc) from exc
         try:
             member(com_value)
         except Exception as call_exc:
-            raise com_error(
-                f"The COM property {last.name!r} could not be set.", call_exc
-            ) from call_exc
+            raise _set_failure(last.name, com_value, call_exc) from call_exc
         applied_via = "parameterized_property"
     except Exception as exc:
-        raise com_error(f"The COM property {last.name!r} could not be set.", exc) from exc
+        raise _set_failure(last.name, com_value, exc) from exc
     return {
         "mode": "set",
         "root": root,
@@ -314,8 +348,63 @@ def execute(
         "property": last.name,
         "value": jsonable(com_value),
         "applied_via": applied_via,
+        **before,
         "unsaved_changes": unsaved_changes(target),
     }
+
+
+def _read_before(owner: Any, name: str, settings: Settings) -> dict[str, Any]:
+    """Read the value a set is about to overwrite so the result is reversible.
+
+    A dry-run or applied `com set` that reports only the new value hides what was
+    there before: an agent that wants to roll the change back has to remember to
+    read it first. The current value is read best-effort; when the member cannot
+    be read (write-only, or a parameterized property) the payload says why.
+    """
+    try:
+        current = getattr(owner, name)
+    except Exception as exc:
+        return {
+            "value_before": None,
+            "value_before_note": f"the current value could not be read ({type(exc).__name__})",
+        }
+    if callable(current):
+        return {
+            "value_before": None,
+            "value_before_note": (
+                "the member is a parameterized property, so its current value is not "
+                "readable as a property"
+            ),
+        }
+    payload = jsonable(current)
+    if isinstance(payload, str) and settings.max_text_chars > 0:
+        payload, truncated = truncate_text(payload, settings.max_text_chars)
+        if truncated:
+            return {"value_before": payload, "value_before_truncated": True}
+    return {"value_before": payload}
+
+
+def _set_failure(name: str, value: Any, exc: BaseException) -> BridgeError:
+    """Map a failed property set to a code the caller can act on."""
+    if name.lower() in _AUTOFIT_PROPERTY_NAMES:
+        details: dict[str, Any] = {
+            "member": name,
+            "value": jsonable(value),
+            "autosize_enums": _AUTOFIT_ENUMS,
+            "hint": _AUTOFIT_HINT,
+        }
+        hresult = getattr(exc, "hresult", None)
+        if hresult is not None:
+            try:
+                details["hresult"] = f"0x{int(hresult) & 0xFFFFFFFF:08X}"
+            except (TypeError, ValueError):
+                pass
+        return autofit_refused(
+            f"Office refused to set {name!r} to {jsonable(value)!r}; the value is most "
+            "likely outside the enum table this autofit member accepts.",
+            details,
+        )
+    return com_error(f"The COM property {name!r} could not be set.", exc)
 
 
 def _render(segments: list[Segment]) -> str:
@@ -435,6 +524,13 @@ def _member_candidates(owner: Any, name: str, limit: int = 12) -> list[str]:
 
 def _member_hint(owner: Any, name: str) -> str | None:
     lowered = name.lower()
+    if lowered == "msoautofitbehavior":
+        return (
+            "PowerPoint's TextFrame2 has no MsoAutoFitBehavior member: its autofit is "
+            "TextFrame2.AutoSize written with the MsoAutoSize enum (0 none, 1 shape fits "
+            "text, 2 text fits shape). Use 'office powerpoint text set-autofit' or read "
+            "the current setting with 'office powerpoint text get-autofit'."
+        )
     if lowered == "text" and _is_callable_member(owner, "TextRange"):
         return (
             "This object exposes TextRange: read or write TextRange.Text instead. "
@@ -447,11 +543,74 @@ def _member_hint(owner: Any, name: str) -> str | None:
     )
 
 
+def _flag(owner: Any, name: str) -> int | None:
+    try:
+        return int(getattr(owner, name))
+    except Exception:
+        return None
+
+
+def _shape_identity(shape: Any) -> dict[str, Any]:
+    identity: dict[str, Any] = {}
+    for key, member in (("shape_name", "Name"), ("shape_type", "Type"), ("shape_index", "Index")):
+        try:
+            identity[key] = jsonable(getattr(shape, member))
+        except Exception:
+            continue
+    return identity
+
+
+def _text_frame_diagnostic(owner: Any, name: str) -> dict[str, Any]:
+    """Describe the shape behind a missing text member (HasTextFrame, name, type).
+
+    Reading TextFrame.TextRange on a picture or a line does not fail with a clean
+    "no text frame" answer: IDispatch reports an unknown member with an opaque
+    exception, which reads like a typo in the expression. Reading HasTextFrame on
+    the shape (or on the text frame's parent) turns it into a diagnosable error.
+    """
+    if name.lower() not in _TEXT_FRAME_MEMBER_NAMES:
+        return {}
+    carrier = owner
+    has_text_frame = _flag(owner, "HasTextFrame")
+    if has_text_frame is None:
+        try:
+            parent = owner.Parent
+        except Exception:
+            parent = None
+        if parent is not None:
+            has_text_frame = _flag(parent, "HasTextFrame")
+            carrier = parent
+    if has_text_frame is None:
+        return {}
+    details: dict[str, Any] = {"has_text_frame": has_text_frame}
+    if carrier is not owner:
+        has_text = _flag(owner, "HasText")
+        if has_text is not None:
+            details["has_text"] = has_text
+    details.update(_shape_identity(carrier))
+    if not has_text_frame:
+        details["hint"] = (
+            "The shape has no text frame (HasTextFrame = 0), so TextFrame.TextRange does "
+            "not exist on it: this is the wrong shape, not a typo in the expression. "
+            "'office powerpoint slides read' lists every shape's index, name, type, and "
+            "text so the text-bearing shape can be picked before reading again."
+        )
+    return details
+
+
 def _unknown_member(owner: Any, name: str, exc: BaseException) -> BridgeError:
     details: dict[str, Any] = {"member": name, "error": str(exc)}
     candidates = _member_candidates(owner, name)
     if candidates:
         details["did_you_mean"] = candidates
+    frame = _text_frame_diagnostic(owner, name)
+    if frame:
+        details.update(frame)
+        return text_frame_missing(
+            f"The member {name!r} is not available because this shape has no usable "
+            "text frame.",
+            details,
+        )
     hint = _member_hint(owner, name)
     if hint:
         details["hint"] = hint

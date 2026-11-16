@@ -113,6 +113,15 @@ office word paragraph replace 12 --text "New body" --yes
 office powerpoint slide inspect
 office powerpoint slides read --start 1 --count 20
 office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
+office powerpoint text read 3 --shape 2
+office powerpoint text get-autofit 3 --shape 3
+office powerpoint text set 3 --shape 3 --paragraphs @paragraphs.json --dry-run
+office powerpoint text set 3 --shape 3 --text @body.txt --yes
+office powerpoint text set-format 3 --shape 3 --paragraph 4-10 --indent-level 2 --font-size 13 --yes
+office powerpoint text set-autofit 3 --shape 3 --behavior text --yes
+office powerpoint text measure 3 --shape 3 --text @draft.txt --font-size 16 --yes
+office powerpoint toc fill 3 --shape 3 --from 1 --to 24 --levels auto --font-size 16 --sub-font-size 13 --dry-run
+office powerpoint sections read
 office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "Note" --yes
 office powerpoint slide add --index 70 --yes
 office powerpoint slide move 72 --to 3 --yes
@@ -125,6 +134,7 @@ office undo --dry-run
 office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
+office com set 'document.Slides(3).Shapes(3).TextFrame.TextRange.Text' --value @toc_text.txt --yes
 office com batch --file steps.json --yes
 office target prune
 office target reconnect t-1a2b3c4d5e6f
@@ -233,6 +243,38 @@ Errors use `{"ok": false, "context": ..., "error": {"code", "message", "details"
   `font_name`, RRGGBB `color`, `bold`) through `TextFrame.TextRange.Font` only;
   dry-run returns the current values and the planned change, the run reads the
   font back and reports `verified`
+- `powerpoint.text.set` rewrites one shape's whole text. `paragraphs` takes
+  strings or `{"text", "level", "font_size"}` objects; `text` is plain text split
+  into paragraphs on CR/LF. The text is written once and the levels and sizes are
+  then applied with `TextRange.Paragraphs(first, count)`, so one operation
+  replaces the old choreography of a `Text` set plus several `com set` calls. LF
+  and CRLF are normalized to PowerPoint's CR paragraph break and reported as
+  `paragraph_breaks` and `newline_conversions`; the result also carries
+  `paragraphs_before` / `paragraphs_after` and `verified`
+- `powerpoint.text.set_format` sets font properties and the paragraph level
+  (`indent_level`, 1-8) on the whole text frame or on a paragraph range
+  (`paragraph: "4-10"` or `[4, 10]`); dry-run reports the values before and after
+  per block
+- `powerpoint.text.set_autofit` sets the autofit behaviour (`none`, `shape` =
+  grow the frame to the text, `text` = shrink text on overflow). It writes
+  `TextFrame2.AutoSize` with the MsoAutoSize enum (that member is the only one
+  that can express shrinking), falling back to a type-library cast and then to
+  `TextFrame.AutoSize`, and reads the resulting state back. Office refusing the
+  value comes back as `AUTOFIT_REFUSED` with both enum tables and a hint in
+  `details`; the matching read is the `powerpoint.text.autofit` inspection
+- `powerpoint.text.measure` answers "does this text fit?" by duplicating the
+  shape, letting the duplicate grow to fit its text, reading the height, and
+  deleting the duplicate. It reports `required_height`, `fits`, and `margin`,
+  optionally for a candidate `font_size` and `text` before anything is written
+- `powerpoint.toc.fill` fills a table-of-contents placeholder from the deck's
+  slide titles. The numbering style is read from the placeholder itself
+  (full-width `０．` or half-width `1. `, including the start number) and reused,
+  only level-1 entries are numbered, `levels` takes a spec such as `"6-12=2"` or
+  `auto` (a title listed in another slide's body text becomes level 2), `exclude`
+  skips slide numbers, and the contents slide is never listed in its own
+  contents. Dry-run previews the exact final text and the per-entry plan; the
+  run reports `entries`, `numbering_style`, `paragraphs_before` /
+  `paragraphs_after`, and `verified`
 - `undo` undoes the most recent Office action in the attached application
   (`application.Undo`); dry-run reports whether anything is undoable
   (`application.Undoable`). Per-app status on this build: PowerPoint calls
@@ -247,8 +289,13 @@ Property changes also require `confirm`. Executed writes report
 
 Curated reads include `excel.range.format` (cell-by-cell fill/font/border reads
 with RRGGBB colors), `word.paragraphs` (paragraph window with style names and
-heading flags) and `word.find` (literal search with paragraph numbers and
-context; read-only, no confirmation). Destructive writes (`slide delete`,
+heading flags), `word.find` (literal search with paragraph numbers and context;
+read-only, no confirmation), `powerpoint.text` (one shape's text with paragraph
+levels, font sizes, geometry, and autofit), `powerpoint.text.autofit` (the
+readable autofit behaviour plus both enum tables), and `powerpoint.sections`
+(section names with their first slide and slide count, read from the
+parameterized `SectionProperties` object because `Slides(n).Section` is not
+reachable through IDispatch). Destructive writes (`slide delete`,
 `shape delete`, `rows/columns delete`) return an `undo_hint`.
 
 ## General operations
@@ -275,16 +322,30 @@ cannot be mistaken for a scalar of the same printed form.
 fields plus a non-empty `steps` array, runs the steps in order on one target,
 and stops at the first failing step (`stopped: true`). Every step is parsed and
 block-checked before anything runs, and one `confirm` covers the whole batch; a
-batch of only `get` steps needs no confirmation.
+batch of only `get` steps needs no confirmation. A batch is not one undo action:
+Office records every applied step separately, so an applied batch reports
+`undo_steps` and an `undo_note` explaining that a single undo reverts only the
+last step.
 
 Unknown member names come back as `INVALID_REQUEST` with `details.did_you_mean`
 (candidate member names on the target object) and `details.hint` (the standard
-substitute, for example `TextRange.Text` for `TextFrame.Text`). In CLI syntax,
-string literals support `\n`, `\t`, `\r`, `\v` (vertical tab), `\/`, and
-`\uXXXX`, and `com set --value @path` loads the value from a UTF-8 file so long
-or multi-line text survives shell quoting and code pages. Executed `call` and
-`set` results report `unsaved_changes`, whether the document now has
-unsaved edits.
+substitute, for example `TextRange.Text` for `TextFrame.Text`). Reaching
+`TextFrame` or `TextRange` on a shape without a text frame is reported as
+`TEXT_FRAME_MISSING` with `details.has_text_frame`, the shape's name, type, and
+index, because the expression has the wrong shape rather than a typo. Setting an
+autofit member to a value Office refuses (`TextFrame.AutoSize = -1` and friends)
+comes back as `AUTOFIT_REFUSED` with `details.autosize_enums` for both autofit
+members and `details.hresult`. In CLI syntax, string literals support `\n`,
+`\t`, `\r`, `\v` (vertical tab), `\/`, and `\uXXXX`. `com set --value @path`,
+`com batch --file`, and the `--text` / `--paragraphs` / `--json` options read
+UTF-8 files and accept a leading byte-order mark (PowerShell 5.1 writes one),
+with the file's line breaks preserved, so CR-separated PowerPoint paragraphs and
+Japanese text survive without shell quoting. Executed `call` and `set` results
+report `unsaved_changes`, whether the document now has unsaved edits, and `set`
+results carry `value_before` (plus `value_before_truncated` for long text, or
+`value_before_note` when the member is a parameterized property) in the dry-run
+preview and in the applied result, so a change can be reversed from the same
+payload.
 
 Only saving and closing are intentionally unavailable: member names starting
 with `save` or `close` (plus `quit` and `exit`) are rejected with

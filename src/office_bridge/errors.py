@@ -22,6 +22,8 @@ class ErrorCode:
     RANGE_TOO_LARGE = "RANGE_TOO_LARGE"
     SIZE_MISMATCH = "SIZE_MISMATCH"
     TEXT_TOO_LARGE = "TEXT_TOO_LARGE"
+    TEXT_FRAME_MISSING = "TEXT_FRAME_MISSING"
+    AUTOFIT_REFUSED = "AUTOFIT_REFUSED"
     CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
     COM_ERROR = "COM_ERROR"
     OFFICE_BUSY = "OFFICE_BUSY"
@@ -145,6 +147,14 @@ def text_too_large(count: int, limit: int) -> BridgeError:
         413,
         {"characters": count, "limit": limit},
     )
+
+
+def text_frame_missing(message: str, details: dict[str, Any] | None = None) -> BridgeError:
+    return BridgeError(ErrorCode.TEXT_FRAME_MISSING, message, 409, details)
+
+
+def autofit_refused(message: str, details: dict[str, Any] | None = None) -> BridgeError:
+    return BridgeError(ErrorCode.AUTOFIT_REFUSED, message, 409, details)
 
 
 def confirmation_required(operation: str) -> BridgeError:

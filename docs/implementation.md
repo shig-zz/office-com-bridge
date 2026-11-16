@@ -488,6 +488,9 @@ CLI の書き込みは次の流れを強制する。
 | `word.document` | Word | 段落数、単語数、文字数、`saved`、`read_only` | 取得失敗時は `null` |
 | `powerpoint.slide` | PowerPoint | スライド番号、枚数、ID、レイアウト、タイトル、図形テキスト | 現在スライドのみ |
 | `powerpoint.document` | PowerPoint | スライド数、ページサイズ、タイトル一覧 | 最大 1000 スライド、タイトルは各 500 文字 |
+| `powerpoint.text` | PowerPoint | 図形1個のテキスト、段落別のレベルとフォントサイズ、図形形状、自動調整 | `slide` と `shape`（index または名前）指定、文字数上限 |
+| `powerpoint.text.autofit` | PowerPoint | 自動調整の状態名と `TextFrame` / `TextFrame2` の現在値、両 enum 表 | 読み取り専用 |
+| `powerpoint.sections` | PowerPoint | セクション名と先頭スライド・枚数・`SectionID` | `SectionProperties` を持つビルドのみ。無い場合は `UNSUPPORTED_OPERATION` |
 
 Excel の範囲読み取りは `Range.Value2` を使い、必要に応じて `Range.Formula` も読む。
 COM が返す 1 次元・2 次元・スカラーの揺れを `_matrix` / `_rectangular` で
@@ -507,6 +510,29 @@ PowerPoint の図形テキストは、テキストフレームと表のセルを
 | `excel.range.set_format` | Excel | フォント・色・配置・罫線などを設定 | 1 つ以上のオプション、セル数上限、`confirm` |
 | `word.selection.insert_text` | Word | 選択範囲に `TypeText` | 非空文字列、文字数上限、`confirm` |
 | `excel.active_sheet` | Excel | シートをアクティブ化 | シート名が存在、`confirm` |
+| `powerpoint.text.set` | PowerPoint | `Text` を一度書き、続けて `Paragraphs(始点, 個数)` でレベルとサイズを適用 | 段落配列またはテキスト、文字数上限、`confirm` |
+| `powerpoint.text.set_format` | PowerPoint | テキストフレーム全体または段落範囲のフォント・段落レベルを設定 | 1 つ以上の指定、`confirm` |
+| `powerpoint.text.set_autofit` | PowerPoint | `TextFrame2.AutoSize` → 型ライブラリ キャスト → `TextFrame.AutoSize` の順で設定し、読み戻す | `behavior` は none / shape / text、`confirm` |
+| `powerpoint.text.measure` | PowerPoint | 図形を複製して伸ばし、必要高さを実測してから複製を削除 | `confirm`（一時的に図形が増える） |
+| `powerpoint.toc.fill` | PowerPoint | スライドタイトルから目次を生成し、番号様式を踏襲して段落書き込み | `slide` / `shape` 指定、文字数上限、`confirm` |
+
+この表は抜粋である。ほかにも `powerpoint.text.replace`、`powerpoint.textbox.add`、
+`powerpoint.notes.set`、`powerpoint.slide.add` / `move` / `delete`、
+`powerpoint.shape.delete` / `set_format`、`excel.range.add_hyperlink`、
+`excel.range.sort`、`excel.rows.*` / `excel.columns.*`、`word.replace`、
+`word.paragraph.replace_text`、`undo` がある。完全な一覧は `/capabilities` が返す。
+
+PowerPoint の段落区切りは CR（U+000D）で、キュレーション書き込みは LF・CRLF を
+CR に正規化し `paragraph_breaks` / `newline_conversions` を返す。CLI のファイル
+引き渡し（`--value @path`、`--paragraphs @path`、`com batch --file`）は
+`utf-8-sig` で読み、バイト順マークを吸収したうえで改行を変換しない。つまり
+CR を書いたファイルはそのまま CR で届く。`com set` は dry-run・実行を問わず
+`value_before`（読めないメンバーは `value_before_note`）を返し、`com batch` は
+適用ステップ数を `undo_steps` として報告する（Office の undo は 1 step ずつ）。
+PowerPoint 側の失敗はコードで区別する: 自動調整メンバーの値拒否は
+`AUTOFIT_REFUSED`（`details.autosize_enums` に両 enum 表）、テキストフレームの
+ない図形で `TextFrame` を辿った場合は `TEXT_FRAME_MISSING`
+（`details.has_text_frame` と図形名・種類・index）。
 
 #### Excel 値書き込み
 
@@ -1043,8 +1069,10 @@ Word と PowerPoint の日常操作ログは、コードとフェイクテスト
 - Excel のキュレーション書き込みは常にアクティブシートが対象。シート名を直接指定できない。
 - Excel の値書き込みはリテラルのみ。数式文字列は拒否する。数式は `/com` で `Formula` を設定する。
 - Word の書き込みは選択範囲へのテキスト挿入のみ。書式や表の操作は `/com` を使う。
-- PowerPoint の書き込みはキュレーションされておらず、`/com` を使う。
-- 保存・クローズは提供しない。
+- PowerPoint のテキスト書き込みはキュレーション済み（`powerpoint.text.set` /
+  `set_format` / `set_autofit` / `measure` / `toc.fill`、`text.replace`、
+  `textbox.add`、`notes.set`）。表の生成・グループ図形の走査・アニメーションなど、
+  まだキュレーションされていない操作は `/com` を使う。- 保存・クローズは提供しない。
 
 ### 13.8 読み取り範囲
 
@@ -1153,7 +1181,9 @@ office_bridge/
 7. **CLI の不足オプション**
    `--underline` など、バックエンドが受け付ける書式オプションを CLI に追加する。
 8. **ロールバック／アンドゥ連携**
-    書式設定の部分適用を避けるため、変更前の値を取得して復元する仕組みを検討する。
+    `com set` は変更前の値を `value_before` として返し、`com batch` は適用ステップ数を
+    `undo_steps` として報告するまで実装済み（§7.2）。書式設定の部分適用を避ける復元
+    手順の自動化は、まだ検討中。
 9. **Office 以外アプリの対象化（roadmap Phase 2）**
    Outlook やブラウザ・PDF など Office 以外の対象種別を追加する。`AppKind` と
    キャプチャ経路の拡張で対応できる形にしているが、Phase 1 では意図的に手付けていない。

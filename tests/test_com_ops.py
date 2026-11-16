@@ -721,3 +721,127 @@ def test_call_hyperlinks_add_skipped_when_parent_is_not_a_range() -> None:
     target = make_target(window=window)
     run("call", 'ActiveSheet.Hyperlinks.Add("https://example.com")', target, confirm=True)
     assert add.calls == [("https://example.com",)]
+
+
+def test_set_dry_run_reports_value_before() -> None:
+    range_node = Node("range", {"Value2": 42})
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("A1").Value2', target, value=7, dry_run=True)
+    assert result["applied"] is False
+    assert result["value_before"] == 42
+    assert range_node.sets == {}
+
+
+def test_set_reports_value_before_when_applied() -> None:
+    range_node = Node("range", {"Value2": 42})
+    sheet = Node("sheet", {"Range": Node("Range", call_result=range_node)})
+    window = Node("window", {"ActiveSheet": sheet})
+    target = make_target(window=window)
+    result = run("set", 'ActiveSheet.Range("A1").Value2', target, value=7, confirm=True)
+    assert result["value_before"] == 42
+    assert result["value"] == 7
+    assert range_node.sets == {"Value2": 7}
+
+
+def test_set_value_before_notes_a_parameterized_property() -> None:
+    text_range = Node("range", {"Text": Node("Text", call_result="old")})
+    window = Node("window", {"ActiveSheet": Node("sheet", {"TextRange": text_range})})
+    target = make_target(window=window)
+    result = run("set", "ActiveSheet.TextRange.Text", target, value="new", dry_run=True)
+    assert result["value_before"] is None
+    assert "parameterized property" in result["value_before_note"]
+    assert result["applied_via"] == "parameterized_property"
+
+
+def test_set_truncates_a_long_value_before() -> None:
+    document = Node("document", {"Text": "y" * 50})
+    target = make_target(document=document)
+    result = run(
+        "set",
+        "Text",
+        target,
+        root="document",
+        value="new",
+        dry_run=True,
+        settings=Settings(max_text_chars=10),
+    )
+    assert result["value_before"] == "y" * 10
+    assert result["value_before_truncated"] is True
+
+
+def test_set_autofit_member_is_refused_with_the_enum_table() -> None:
+    class OfficeRefusal(Exception):
+        """Stand-in for the bare DISP_E_EXCEPTION Office raises for a bad enum value."""
+
+        def __init__(self, hresult: int) -> None:
+            super().__init__("Exception occurred.")
+            self.hresult = hresult
+
+    class RejectingNode(Node):
+        def __init__(self, name: str, members: dict[str, Any], refuses: set[str]) -> None:
+            super().__init__(name, members)
+            object.__setattr__(self, "_refuses", refuses)
+
+        def __setattr__(self, key: str, value: Any) -> None:
+            if key in self.__dict__.get("_refuses", ()):
+                raise OfficeRefusal(0x800A03EC)
+            super().__setattr__(key, value)
+
+    frame = RejectingNode("textframe", {"AutoSize": 0, "HasText": -1}, {"AutoSize"})
+    shape = Node("shape", {"TextFrame": frame, "HasTextFrame": -1, "Name": "Body 2"})
+    slides = Node("slides", {"Item": Node("Item", call_result=shape)})
+    document = Node("document", {"Slides": slides})
+    target = make_target(window=Node("window"), document=document)
+
+    with pytest.raises(BridgeError) as excinfo:
+        run(
+            "set",
+            "document.Slides.Item(3).TextFrame.AutoSize",
+            target,
+            value=-1,
+            confirm=True,
+        )
+    error = excinfo.value
+    assert error.code == ErrorCode.AUTOFIT_REFUSED
+    assert error.details["member"] == "AutoSize"
+    assert error.details["hresult"] == "0x800A03EC"
+    enums = error.details["autosize_enums"]
+    assert enums["TextFrame.AutoSize"]["ppAutoSizeShapeToFitText"] == 1
+    assert enums["TextFrame2.AutoSize"]["msoAutoSizeTextToFitShape"] == 2
+    assert "powerpoint text set-autofit" in error.details["hint"]
+    assert "AutoSize" not in frame.sets
+
+
+def test_unknown_msoautofitbehavior_member_explains_the_real_member() -> None:
+    frame2 = Node("textframe2", {"AutoSize": 0, "WordWrap": -1})
+    shape = Node("shape", {"TextFrame2": frame2, "HasTextFrame": -1})
+    slides = Node("slides", {"Item": Node("Item", call_result=shape)})
+    document = Node("document", {"Slides": slides})
+    target = make_target(window=Node("window"), document=document)
+
+    with pytest.raises(BridgeError) as excinfo:
+        run("get", "document.Slides.Item(3).TextFrame2.MsoAutoFitBehavior", target)
+    assert excinfo.value.code == ErrorCode.INVALID_REQUEST
+    assert "MsoAutoSize" in excinfo.value.details["hint"]
+    assert "get-autofit" in excinfo.value.details["hint"]
+
+
+def test_missing_text_frame_reports_text_frame_missing() -> None:
+    picture = Node(
+        "picture", {"HasTextFrame": 0, "Name": "Picture 1", "Type": 13, "Index": 2}
+    )
+    slides = Node("slides", {"Item": Node("Item", call_result=picture)})
+    document = Node("document", {"Slides": slides})
+    target = make_target(window=Node("window"), document=document)
+
+    with pytest.raises(BridgeError) as excinfo:
+        run("get", "document.Slides.Item(2).TextFrame.TextRange.Text", target)
+    error = excinfo.value
+    assert error.code == ErrorCode.TEXT_FRAME_MISSING
+    assert error.details["member"] == "TextFrame"
+    assert error.details["has_text_frame"] == 0
+    assert error.details["shape_name"] == "Picture 1"
+    assert error.details["shape_type"] == 13
+    assert "powerpoint slides read" in error.details["hint"]

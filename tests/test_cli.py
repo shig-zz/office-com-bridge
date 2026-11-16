@@ -612,8 +612,8 @@ def test_com_set_value_from_utf8_file(tmp_path, monkeypatch) -> None:
     client = FakeClient()
     install_client(monkeypatch, client)
     path = tmp_path / "note.txt"
-    raw = "日本語メモ\n段落区切り"
-    path.write_text(raw, encoding="utf-8")
+    raw = "日本語メモ\r段落区切り"
+    path.write_bytes(raw.encode("utf-8"))
     result = CliRunner().invoke(
         cli.app, ["com", "set", "TextRange.Text", "--value", f"@{path}", "--yes"]
     )
@@ -969,7 +969,7 @@ def test_powerpoint_notes_set_text_from_file(tmp_path, monkeypatch) -> None:
     client = FakeClient()
     install_client(monkeypatch, client)
     path = tmp_path / "notes.txt"
-    path.write_text("一行目\n二行目", encoding="utf-8")
+    path.write_bytes("一行目\n二行目".encode("utf-8"))
     result = CliRunner().invoke(
         cli.app,
         ["powerpoint", "notes", "set", "70", "--text", f"@{path}", "--yes"],
@@ -1225,3 +1225,231 @@ def test_confirm_write_target_mismatch_refuses(monkeypatch) -> None:
         cli.typer, "confirm", lambda *args, **kwargs: pytest.fail("must not prompt")
     )
     assert cli._confirm_write(ctx, client, "write A1:B2", "Other.xlsx") is False
+
+
+def test_com_set_value_from_file_accepts_a_bom(tmp_path, monkeypatch) -> None:
+    """PowerShell 5.1 writes a BOM, and a CR paragraph break must survive the read."""
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "value.txt"
+    path.write_bytes("\ufeff日本語メモ\r段落区切り".encode("utf-8"))
+    result = CliRunner().invoke(
+        cli.app, ["com", "set", "TextRange.Text", "--value", f"@{path}", "--yes"]
+    )
+    assert result.exit_code == 0
+    assert client.com_calls[0][3] == "日本語メモ\r段落区切り"
+
+
+def test_com_batch_file_accepts_a_bom(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "toc_batch.json"
+    steps = [
+        {
+            "mode": "set",
+            "expression": "document.Slides(3).Shapes(3).TextFrame.TextRange.Text",
+            "value": "０．表紙\r１．改定履歴",
+        },
+        {
+            "mode": "set",
+            "expression": "document.Slides(3).Shapes(3).TextFrame.TextRange.Paragraphs(4, 7).IndentLevel",
+            "value": 2,
+        },
+    ]
+    path.write_text("\ufeff" + json.dumps(steps, ensure_ascii=False), encoding="utf-8")
+    result = CliRunner().invoke(cli.app, ["com", "batch", "--file", str(path), "--yes"])
+    assert result.exit_code == 0
+    sent_steps, confirm, _expected = client.batch_calls[0]
+    assert confirm is True
+    assert len(sent_steps) == 2
+    assert sent_steps[0]["value"] == "０．表紙\r１．改定履歴"
+
+
+def test_com_batch_missing_file_fails_without_calling(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["com", "batch", "--file", str(tmp_path / "missing-batch.json"), "--yes"]
+    )
+    assert result.exit_code != 0
+    assert client.batch_calls == []
+
+
+def test_powerpoint_text_read_inspects_one_shape(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {"kind": kind}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "text", "read", "3", "--shape", "2"]
+    )
+    assert result.exit_code == 0
+    assert captured["kind"] == "powerpoint.text"
+    assert captured["params"] == {"slide": 3, "shape": 2}
+
+
+def test_powerpoint_text_get_autofit_inspects(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {"kind": kind}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "text", "get-autofit", "3", "--shape", "Body"]
+    )
+    assert result.exit_code == 0
+    assert captured["kind"] == "powerpoint.text.autofit"
+    assert captured["params"] == {"slide": 3, "shape": "Body"}
+
+
+def test_powerpoint_text_set_paragraphs_from_file(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "paragraphs.json"
+    path.write_text(
+        "\ufeff"
+        + json.dumps(
+            [
+                {"text": "０．表紙", "level": 1, "font_size": 16},
+                {"text": "アルミフレーム", "level": 2, "font_size": 13},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "text", "set", "3", "--shape", "2", "--paragraphs", f"@{path}", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.text.set"
+    assert params["paragraphs"] == [
+        {"text": "０．表紙", "level": 1, "font_size": 16},
+        {"text": "アルミフレーム", "level": 2, "font_size": 13},
+    ]
+    assert params["confirm"] is True
+
+
+def test_powerpoint_text_set_splits_text_on_line_breaks(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "text", "set", "3", "--shape", "2", "--text", "紹介\r背景", "--dry-run"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.text.set"
+    assert params["dry_run"] is True
+    assert "confirm" not in params
+
+
+def test_powerpoint_text_set_requires_paragraphs_or_text(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(cli.app, ["powerpoint", "text", "set", "3", "--shape", "2"])
+    assert result.exit_code == 2
+    assert client.invocations == []
+
+
+def test_powerpoint_text_set_autofit_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        ["powerpoint", "text", "set-autofit", "3", "--shape", "2", "--behavior", "text", "--yes"],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.text.set_autofit"
+    assert params == {"slide": 3, "shape": 2, "behavior": "text", "dry_run": False, "confirm": True}
+
+
+def test_powerpoint_text_measure_passes_draft_text(tmp_path, monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    path = tmp_path / "draft.txt"
+    path.write_bytes("\ufeff長い目次の草稿\r2行目".encode("utf-8"))
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "text", "measure", "3", "--shape", "2",
+            "--text", f"@{path}", "--font-size", "16", "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.text.measure"
+    assert params["text"] == "長い目次の草稿\r2行目"
+    assert params["font_size"] == 16.0
+    assert params["dry_run"] is True
+
+
+def test_powerpoint_toc_fill_with_yes(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "powerpoint", "toc", "fill", "3", "--shape", "3",
+            "--from", "2", "--to", "24", "--exclude", "3,5",
+            "--levels", "6-12=2", "--numbering", "auto",
+            "--font-size", "16", "--sub-font-size", "13", "--yes",
+        ],
+    )
+    assert result.exit_code == 0
+    operation, params = client.invocations[0]
+    assert operation == "powerpoint.toc.fill"
+    assert params == {
+        "slide": 3,
+        "shape": 3,
+        "dry_run": False,
+        "from": 2,
+        "to": 24,
+        "exclude": "3,5",
+        "levels": "6-12=2",
+        "numbering": "auto",
+        "font_size": 16.0,
+        "sub_font_size": 13.0,
+        "confirm": True,
+    }
+
+
+def test_powerpoint_toc_fill_dry_run_does_not_confirm(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    result = CliRunner().invoke(
+        cli.app, ["powerpoint", "toc", "fill", "3", "--shape", "3", "--dry-run"]
+    )
+    assert result.exit_code == 0
+    _operation, params = client.invocations[0]
+    assert params["dry_run"] is True
+    assert "confirm" not in params
+
+
+def test_powerpoint_sections_read_inspects(monkeypatch) -> None:
+    client = FakeClient()
+    install_client(monkeypatch, client)
+    captured: dict[str, Any] = {}
+
+    def inspect(kind, params=None):
+        captured["kind"] = kind
+        captured["params"] = params
+        return {"ok": True, "context": None, "result": {"kind": kind}}
+
+    client.inspect = inspect
+    result = CliRunner().invoke(cli.app, ["powerpoint", "sections", "read"])
+    assert result.exit_code == 0
+    assert captured["kind"] == "powerpoint.sections"

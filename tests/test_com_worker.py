@@ -484,3 +484,55 @@ def test_target_lost_reports_reconnect_available(core, monkeypatch) -> None:
     assert excinfo.value.code == ErrorCode.TARGET_LOST
     assert excinfo.value.details["reason"] == "com_reference_lost"
     assert excinfo.value.details["reconnect_available"] is True
+
+
+def test_com_batch_reports_undo_steps_for_applied_writes(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+
+    def fake_execute(target, mode, root, segments, value, dry_run, params, settings):  # noqa: ANN001
+        return {"mode": mode, "applied": not dry_run}
+
+    monkeypatch.setattr(com_worker.com_ops, "execute", fake_execute)
+    result, _summary = core.com_batch(
+        [
+            {"mode": "get", "expression": "Name"},
+            {
+                "mode": "set",
+                "expression": "Slides(3).Shapes(3).TextFrame.TextRange.Text",
+                "value": "０．表紙\r１．改定履歴",
+            },
+            {
+                "mode": "set",
+                "expression": "Slides(3).Shapes(3).TextFrame.TextRange.Paragraphs(4, 7).IndentLevel",
+                "value": 2,
+            },
+            {
+                "mode": "set",
+                "expression": "Slides(3).Shapes(3).TextFrame2.AutoSize",
+                "value": 2,
+                "dry_run": True,
+            },
+        ],
+        {"confirm": True},
+    )
+    assert result["applied"] == 2
+    assert result["stopped"] is False
+    # One approval, but Office records each write as its own undo action.
+    assert result["undo_steps"] == 2
+    assert "undo" in result["undo_note"]
+
+
+def test_com_batch_without_writes_reports_no_undo_steps(core, monkeypatch) -> None:
+    capture(core, monkeypatch, 1000)
+
+    def fake_execute(target, mode, root, segments, value, dry_run, params, settings):  # noqa: ANN001
+        return {"mode": mode}
+
+    monkeypatch.setattr(com_worker.com_ops, "execute", fake_execute)
+    result, _summary = core.com_batch(
+        [{"mode": "get", "expression": "Name"}, {"mode": "set", "expression": "Text", "value": "x", "dry_run": True}],
+        {},
+    )
+    assert result["applied"] == 0
+    assert "undo_steps" not in result
+    assert "undo_note" not in result

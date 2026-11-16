@@ -655,17 +655,29 @@ class BridgeCore:
                 result = {key: value for key, value in result.items() if key != "target"}
             results.append({"step": index, "ok": True, "mode": step["mode"], "result": result})
             last_summary = summary
-        payload = {
+        applied = sum(
+            1
+            for item in results
+            if item["ok"]
+            and not parsed[item["step"]]["dry_run"]
+            and parsed[item["step"]]["mode"] != "get"
+        )
+        payload: dict[str, Any] = {
             "steps": results,
-            "applied": sum(
-                1
-                for item in results
-                if item["ok"]
-                and not parsed[item["step"]]["dry_run"]
-                and parsed[item["step"]]["mode"] != "get"
-            ),
+            "applied": applied,
             "stopped": stopped,
         }
+        if applied:
+            # One approval covers the batch, but Office undo works one action at a
+            # time: report how many undo actions the batch cost so a rollback plan
+            # is not built on the assumption that one undo rewinds everything.
+            payload["undo_steps"] = applied
+            payload["undo_note"] = (
+                f"The batch applied {applied} write step(s); Office records each one as a "
+                "separate undo action, so a single 'undo' reverts only the last step. "
+                "Undo repeatedly (checking the document between undos) or re-apply the "
+                "previous values instead."
+            )
         return payload, last_summary
 
     def _window_still_open(self, target_id: str | None) -> bool:

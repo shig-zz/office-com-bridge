@@ -87,6 +87,15 @@ office word paragraph replace 12 --text "新しい本文" --yes
 office powerpoint slide inspect
 office powerpoint slides read --start 1 --count 20
 office powerpoint text replace 3 --shape 2 --find "1979" --replace "1982" --dry-run
+office powerpoint text read 3 --shape 2
+office powerpoint text get-autofit 3 --shape 3
+office powerpoint text set 3 --shape 3 --paragraphs @paragraphs.json --dry-run
+office powerpoint text set 3 --shape 3 --text @body.txt --yes
+office powerpoint text set-format 3 --shape 3 --paragraph 4-10 --indent-level 2 --font-size 13 --yes
+office powerpoint text set-autofit 3 --shape 3 --behavior text --yes
+office powerpoint text measure 3 --shape 3 --text @draft.txt --font-size 16 --yes
+office powerpoint toc fill 3 --shape 3 --from 1 --to 24 --levels auto --font-size 16 --sub-font-size 13 --dry-run
+office powerpoint sections read
 office powerpoint textbox add 3 --left 57 --top 452 --width 830 --height 41 --text "補足" --yes
 office powerpoint slide add --index 70 --yes
 office powerpoint slide move 72 --to 3 --yes
@@ -99,6 +108,7 @@ office undo --dry-run
 office com get 'window.ActiveSheet.Range("A1").Value2'
 office com call 'window.ActiveSheet.Rows("2:4").Insert(-4107)' --yes
 office com set 'window.Selection.Font.Bold' --value true --dry-run
+office com set 'document.Slides(3).Shapes(3).TextFrame.TextRange.Text' --value @toc_text.txt --yes
 office com batch --file steps.json --yes
 office target prune
 office target reconnect t-1a2b3c4d5e6f
@@ -160,12 +170,17 @@ office target reconnect t-1a2b3c4d5e6f
 - `powerpoint.slide.move` — 指定スライドを新しい位置へ移動する(`Slides(n).MoveTo`)。dry-runはタイトルと移動方向を返し、実行後は同じSlideIDが目的地indexに着いたことを検証する
 - `powerpoint.shape.delete` — 図形をindexまたは名前で削除する。dry-runは図形名・種類・テキストプレビューを返し、実行後は図形数が1減ったことを検証して取り消し案内(`undo_hint`)を付ける
 - `powerpoint.shape.set_format` — 指定図形のテキスト書式(`font_size`・`font_name`・RRGGBBの`color`・`bold`)を設定する。書き込むのは`TextFrame.TextRange.Font`だけで、図形枠や塗りには触れない。dry-runは現在値と変更予定を返し、実行後は読み戻して`verified`を付ける
+- `powerpoint.text.set` — 指定図形のテキストを段落単位で書き換える。`paragraphs`は文字列または`{"text", "level", "font_size"}`の配列、`text`はCR/LFで段落に分割する平文テキスト。テキストを一度書き、続けて`TextRange.Paragraphs(始点, 個数)`でレベルとサイズを適用するため、`Text`設定＋`com set`数回の手作業を1操作にまとめられる。LF・CRLFはPowerPointの段落区切りCRへ正規化され、`paragraph_breaks`と`newline_conversions`で報告する。結果には`paragraphs_before`/`paragraphs_after`と`verified`も付く
+- `powerpoint.text.set_format` — テキストフレーム全体または段落範囲(`paragraph: "4-10"`または`[4, 10]`)にフォント設定と段落レベル(`indent_level` 1-8)を適用する。dry-runはブロック別の前後値を返す
+- `powerpoint.text.set_autofit` — 自動調整を指定する(`none`、`shape`=枠をテキストへ伸ばす、`text`=溢出時に文字を縮小)。縮小を表せるのはMsoAutoSizeで書く`TextFrame2.AutoSize`だけなのでこれを優先し、失敗すれば型ライブラリ経由のキャスト、それもだめなら`TextFrame.AutoSize`へ逃げる。適用後は状態を読み戻す。Officeが値を拒否すると`AUTOFIT_REFUSED`に両メンバーのenum表と`details.hresult`を添えて返す。読み取りはinspectの`powerpoint.text.autofit`
+- `powerpoint.text.measure` — 「このテキストは収まるか」を図形複製で実測する。複製を作って自動調整で伸ばし、高さを読み取り、複製を削除する。結果は`required_height`・`fits`・`margin`で、`font_size`と`text`を指定するとその条件での必要高さを返す(書き込み前の検討に使える)
+- `powerpoint.toc.fill` — 目次プレースホルダーをスライドタイトルで埋める。番号様式はプレースホルダー既存のテキストから読み取って踏襲する(全角`０．`か半角`1. `、開始番号を含む)。番号はレベル1の項目にだけ付き、`levels`は`"6-12=2"`形式の指定または`auto`(他スライドの本文に列挙されるタイトルをレベル2にする)、`exclude`でスライド番号をスキップし、目次スライド自身は目次に載せない。dry-runは最終テキスト全文と項目別の計画を返し、実行後は`entries`・`numbering_style`・`paragraphs_before`/`paragraphs_after`・`verified`を返す
 - `undo` — 接続済みアプリの直近の操作を取り消す(`application.Undo`)。dry-runは取り消し可能性があるか(`application.Undoable`)を返す。アプリ別の実測状態:PowerPointは呼べる、WordはこのビルドでUndo呼び出し自体が失敗する(エラーにUIのCtrl+Zへの案内が入る)、Excelは未検証——危険な実験はundoに頼らずファイルレベルのコピーまたは白紙克隆文書上で行うこと
 - `excel.active_sheet` — `/set-property`経由で変更
 
 書き込み操作は`dry_run`に対応し、dry_run以外は`confirm`を要求します。プロパティ変更にも`confirm`が必要です。実行した書き込みの結果には`unsaved_changes`(未保存の変更があるか)が付くので、エージェントはユーザーにOfficeで保存するよう伝えられます。
 
-用意済み読み取りには`excel.range.format`(セル単位の塗り・フォント・罫線読み。色はRRGGBBへ変換済み)、`word.paragraphs`(スタイル名と見出しフラグ付きの段落ウィンドウ)、`word.find`(読み取り専用。段落番号と前後の文脈付きで検索語の該当を列挙、確認不要)があります。破壊的な書き込み(`slide delete`・`shape delete`・`rows/columns delete`)の結果には`undo_hint`が付きます。
+用意済み読み取りには`excel.range.format`(セル単位の塗り・フォント・罫線読み。色はRRGGBBへ変換済み)、`word.paragraphs`(スタイル名と見出しフラグ付きの段落ウィンドウ)、`word.find`(読み取り専用。段落番号と前後の文脈付きで検索語の該当を列挙、確認不要)、`powerpoint.text`(図形1個のテキストを段落レベル・フォントサイズ・図形形状・自動調整付きで読む)、`powerpoint.text.autofit`(現在の自動調整状態と両メンバーのenum表)、`powerpoint.sections`(セクション名と担当スライド範囲。`Slides(n).Section`はIDispatchで辿れないため、引数付きの`SectionProperties`から読む)があります。破壊的な書き込み(`slide delete`・`shape delete`・`rows/columns delete`)の結果には`undo_hint`が付きます。
 
 ## 汎用操作
 
@@ -179,9 +194,9 @@ office target reconnect t-1a2b3c4d5e6f
 
 `get`はプロパティの読み取り、`call`はメソッドの実行、`set`は`value`をプロパティへ代入します。`root`を明示しない限り、式の先頭セグメントがルートを兼ねます。`call`と`set`は`dry_run`に対応し、dry_run以外は`confirm`を要求します。実行した`call`の結果には`result_type`(返り値の型名)も付くため、文字列化されたCOMオブジェクトを同じ表示のスカラ取り違えることはありません。
 
-存在しないメンバー名は`INVALID_REQUEST`で差し戻し、`details.did_you_mean`に対象オブジェクトの実メンバー名の候補、`details.hint`に定番の代替経路(例: `TextFrame.Text`なら`TextRange.Text`)を載せます。`com set`の`--value`は`@path`でUTF-8ファイルから値を読み込めるため、日本語の長文・複数行テキストをシェルの引用符やコードページに左右されず渡せます。式内の文字列リテラルは`\n`、`\t`、`\r`、`\v`(縦タブ)、`\/`、`\uXXXX`のエスケープに対応します。実行した`call`と`set`の結果には`unsaved_changes`(未保存の変更があるか)が付きます。
+存在しないメンバー名は`INVALID_REQUEST`で差し戻し、`details.did_you_mean`に対象オブジェクトの実メンバー名の候補、`details.hint`に定番の代替経路(例: `TextFrame.Text`なら`TextRange.Text`)を載せる。テキストフレームを持たない図形で`TextFrame`や`TextRange`を辿った場合は`TEXT_FRAME_MISSING`となり、`details.has_text_frame`と図形名・種類・indexを添える(式の図形違いで、綴り間違いではないことを示す)。自動調整メンバーをOfficeが拒否する値で設定すると`AUTOFIT_REFUSED`で、`details.autosize_enums`に両メンバーのenum表、`details.hresult`にOfficeが返した値が入る。`com set`の`--value @path`、`com batch --file`、`--text`・`--paragraphs`・`--json`はいずれもUTF-8ファイルを読み込み、先頭のバイト順マーク(PowerShell 5.1が書く)を許容し、ファイル内の改行はそのまま保つため、CRで区切ったPowerPointの段落や日本語テキストをシェルの引用符に左右されず渡せる。式内の文字列リテラルは`\n`、`\t`、`\r`、`\v`(縦タブ)、`\/`、`\uXXXX`のエスケープに対応します。実行した`call`と`set`の結果には`unsaved_changes`(未保存の変更があるか)が付く。`set`はdry-run・実行を問わず`value_before`(長いテキストは`value_before_truncated`、パラメータ付きプロパティなど読めない場合は`value_before_note`)も返すので、同じ結果から元へ戻せる。
 
-`POST /com/batch`(CLIは`office com batch --file steps.json`)は同じ項目に加えて空でない`steps`配列を受け取り、1つのターゲットへ全stepを順に実行し、最初の失敗で停止します(`stopped: true`)。全stepは実行前に構文とブロックリストの検査を終えるため、途中で不正なstepがあれば何も実行されずに`details.step`付きでエラーになります。`confirm`1回でバッチ全体を承認でき、`get`のみのバッチに確認は不要です。
+`POST /com/batch`(CLIは`office com batch --file steps.json`)は同じ項目に加えて空でない`steps`配列を受け取り、1つのターゲットへ全stepを順に実行し、最初の失敗で停止します(`stopped: true`)。全stepは実行前に構文とブロックリストの検査を終えるため、途中で不正なstepがあれば何も実行されずに`details.step`付きでエラーになります。`confirm`1回でバッチ全体を承認でき、`get`のみのバッチに確認は不要です。ただしバッチは取り消し1回分ではない。Officeは適用したstep1つずつを取り消し単位に記録するため、適用後の結果は`undo_steps`と`undo_note`(1回のundoで戻る直前は最後のstepだけだという案内)を返す。
 
 あえて通さないのは保存と終了の2種類だけです。名前の先頭が`save`または`close`のメンバー(`quit`と`exit`も)は、メソッド呼び出しとプロパティ設定で`OPERATION_BLOCKED`として差し戻します。プロパティの読み取り(`document.Saved`など)はいくらでもできます。拒否リストへの追加は`OFFICE_BRIDGE_BLOCKED_CALLS`(カンマ区切り)で。
 

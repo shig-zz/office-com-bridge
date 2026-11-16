@@ -111,6 +111,27 @@ def inspect(target: ResolvedTarget, kind: str, params: dict[str, Any], settings:
             max_text_chars=settings.max_text_chars,
         )
 
+    if kind == "powerpoint.text":
+        _require_app(target, AppKind.POWERPOINT, kind)
+        return powerpoint.text_read(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            max_text_chars=settings.max_text_chars,
+        )
+
+    if kind == "powerpoint.text.autofit":
+        _require_app(target, AppKind.POWERPOINT, kind)
+        return powerpoint.autofit_read(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+        )
+
+    if kind == "powerpoint.sections":
+        _require_app(target, AppKind.POWERPOINT, kind)
+        return powerpoint.sections(target)
+
     raise unsupported_operation(kind)
 
 
@@ -394,6 +415,77 @@ def _invoke(
             params=params,
         )
 
+    if operation == "powerpoint.text.set":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        if "paragraphs" not in params:
+            raise invalid_request("Parameter 'paragraphs' is required.")
+        return powerpoint.text_set(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            paragraphs=params.get("paragraphs"),
+            dry_run=optional_bool(params, "dry_run", False),
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
+    if operation == "powerpoint.text.set_format":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        return powerpoint.text_set_format(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            paragraph=params.get("paragraph"),
+            font_size=params.get("font_size"),
+            font_name=params.get("font_name"),
+            color=params.get("color"),
+            bold=params.get("bold"),
+            indent_level=params.get("indent_level"),
+            dry_run=optional_bool(params, "dry_run", False),
+            params=params,
+        )
+
+    if operation == "powerpoint.text.set_autofit":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        return powerpoint.text_set_autofit(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            behavior=params.get("behavior"),
+            dry_run=optional_bool(params, "dry_run", False),
+            params=params,
+        )
+
+    if operation == "powerpoint.text.measure":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        return powerpoint.text_measure(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            text=params.get("text"),
+            font_size=params.get("font_size"),
+            dry_run=optional_bool(params, "dry_run", False),
+            params=params,
+        )
+
+    if operation == "powerpoint.toc.fill":
+        _require_app(target, AppKind.POWERPOINT, operation)
+        return powerpoint.toc_fill(
+            target,
+            slide_index=params.get("slide"),
+            shape_ref=params.get("shape"),
+            start=params.get("from"),
+            end=params.get("to"),
+            exclude=params.get("exclude"),
+            levels=params.get("levels"),
+            numbering=params.get("numbering"),
+            font_size=params.get("font_size"),
+            sub_font_size=params.get("sub_font_size"),
+            dry_run=optional_bool(params, "dry_run", False),
+            max_text_chars=settings.max_text_chars,
+            params=params,
+        )
+
     raise unsupported_operation(operation)
 
 
@@ -557,6 +649,47 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "params": {
                     "slide": {"type": "number", "required": True, "note": "1-based slide number."},
                 },
+            },
+            {
+                "name": "powerpoint.text",
+                "applications": ["PowerPoint"],
+                "mode": "read",
+                "description": (
+                    "Read one shape's text with its paragraph count, per-paragraph "
+                    "IndentLevel and font size, the shape geometry, and the autofit "
+                    "state. Use this instead of a chain of com get calls when planning a "
+                    "text edit: one call answers text, levels, sizes, and frame height."
+                ),
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                },
+            },
+            {
+                "name": "powerpoint.text.autofit",
+                "applications": ["PowerPoint"],
+                "mode": "read",
+                "description": (
+                    "Read a shape's autofit behaviour from both members (TextFrame.AutoSize "
+                    "uses PpAutoSize, TextFrame2.AutoSize uses MsoAutoSize) plus word wrap "
+                    "and geometry. 'text_fits_shape' is the UI's 'Shrink text on overflow'."
+                ),
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                },
+            },
+            {
+                "name": "powerpoint.sections",
+                "applications": ["PowerPoint"],
+                "mode": "read",
+                "description": (
+                    "Read the presentation's sections through SectionProperties: name, "
+                    "first slide, slide count, and last slide for every section. The "
+                    "Slides(n).Section member is not reachable on this build, so the "
+                    "ranges come from the parameterized SectionProperties object."
+                ),
+                "params": {},
             },
         ],
         "operations": [
@@ -1002,6 +1135,141 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 },
             },
             {
+                "name": "powerpoint.text.set",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Replace one shape's whole text with an array of paragraphs, applying "
+                    "per-paragraph indent level and font size in the same step. Unlike a "
+                    "raw TextRange.Text assignment it reports the previous text, the "
+                    "before/after paragraph counts, and 'verified'. Line feeds in the "
+                    "text are converted to PowerPoint's CR paragraph break and reported "
+                    "as paragraph_breaks. CLI: --paragraphs takes JSON or '@path'."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                    "paragraphs": {
+                        "type": "array",
+                        "required": True,
+                        "items": "strings or {text, level|indent_level, font_size} objects",
+                        "note": (
+                            "One array item becomes one paragraph (extra CRs inside an "
+                            "item add paragraphs). 'level' is the PowerPoint IndentLevel (1-8)."
+                        ),
+                    },
+                    "dry_run": {"type": "boolean", "required": False, "note": "Dry-run previews the full text and the planned levels/sizes."},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.text.set_format",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Set font properties and the paragraph IndentLevel on one shape's "
+                    "text, limited to a paragraph range when 'paragraph' is given "
+                    "(\"4\", \"4-10\", or a list). This is the curated way to give a list "
+                    "levels and per-level sizes; dry-run reports the current values of "
+                    "every targeted block."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                    "paragraph": {"type": "number|string", "required": False, "note": "1-based paragraph number, \"first-last\" range, or a list; omit for the whole text frame."},
+                    "font_size": {"type": "number", "required": False, "note": "Point size 1-400."},
+                    "font_name": {"type": "string", "required": False},
+                    "color": {"type": "string", "required": False, "note": "RRGGBB hex; converted to Office's BGR integer."},
+                    "bold": {"type": "boolean", "required": False},
+                    "indent_level": {"type": "number", "required": False, "note": "Paragraph level 1-8 (PowerPoint IndentLevel)."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.text.set_autofit",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Set a shape's autofit behaviour: none, shape (grow the frame to fit "
+                    "the text) or text (the UI's 'Shrink text on overflow'). TextFrame2."
+                    "AutoSize is tried first because it is the only member whose enum "
+                    "(MsoAutoSize) contains text_fits_shape; a type-library cast of "
+                    "TextFrame to TextFrame2 is tried next for builds where dynamic "
+                    "dispatch will not name the member, and TextFrame.AutoSize "
+                    "(PpAutoSize) last for the behaviours it can express. Every attempt "
+                    "is reported and the result is read back; a refusal is "
+                    "AUTOFIT_REFUSED with both enum tables in details."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                    "behavior": {"type": "string", "required": True, "values": ["none", "shape", "text"]},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.text.measure",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Measure whether text fits a frame: the shape is duplicated, the "
+                    "duplicate is switched to 'shape fits text' so PowerPoint lays the "
+                    "text out itself, its height is read as required_height, and the "
+                    "duplicate is deleted. Pass text and font_size to test a draft or a "
+                    "point size before writing it. Reported in points, with fits and "
+                    "margin. The duplicate changes the shape count twice, so this is a "
+                    "confirm-required write even though the deck ends unchanged."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "1-based slide number."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name."},
+                    "text": {"type": "string", "required": False, "note": "Draft text to measure; omit to measure the shape's current text."},
+                    "font_size": {"type": "number", "required": False, "note": "Optional point size to test."},
+                    "dry_run": {"type": "boolean", "required": False, "note": "Reports the frame and text without duplicating."},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
+                "name": "powerpoint.toc.fill",
+                "applications": ["PowerPoint"],
+                "mode": "write",
+                "description": (
+                    "Fill a table-of-contents placeholder with the deck's slide titles: "
+                    "collects the titles of the slide range (the TOC slide itself is "
+                    "skipped), keeps the numbering style already present in the "
+                    "placeholder (full-width digits and a full-width stop, for example, "
+                    "including its starting number), numbers only level-1 entries, and "
+                    "writes everything through the paragraph-aware text write so levels "
+                    "and per-level sizes land in one step. Dry-run previews the exact "
+                    "final text plus the slide-to-paragraph mapping."
+                ),
+                "requires_confirmation": True,
+                "params": {
+                    "slide": {"type": "number", "required": True, "note": "The TOC slide holding the placeholder."},
+                    "shape": {"type": "number|string", "required": True, "note": "1-based shape index or shape name of the body placeholder."},
+                    "from": {"type": "number", "required": False, "note": "First slide to collect titles from; default 1."},
+                    "to": {"type": "number", "required": False, "note": "Last slide to collect; default the last slide."},
+                    "exclude": {"type": "array|csv", "required": False, "note": "Slide numbers to skip, in addition to the TOC slide itself."},
+                    "levels": {"type": "string|object", "required": False, "note": "\"auto\" (a title listed in another slide's body text becomes level 2), or a spec such as \"6-12=2,15=2\"."},
+                    "numbering": {"type": "string", "required": False, "values": ["auto", "fullwidth-dot", "ascii-dot", "digits", "none"], "note": "auto reuses the style detected in the existing text."},
+                    "font_size": {"type": "number", "required": False, "note": "Point size for level-1 entries."},
+                    "sub_font_size": {"type": "number", "required": False, "note": "Point size for level 2 and deeper."},
+                    "dry_run": {"type": "boolean", "required": False},
+                    "expected_document": {"type": "string", "required": False},
+                    "confirm": {"type": "boolean", "required": True},
+                },
+            },
+            {
                 "name": "undo",
                 "applications": ["Excel", "Word", "PowerPoint"],
                 "mode": "write",
@@ -1047,7 +1315,9 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "anything the curated commands above do not cover; save and close "
                 "operations are blocked (see security.blocked_calls). The batch "
                 "endpoint runs an array of steps in one request with one "
-                "confirmation, stopping at the first failing step."
+                "confirmation, stopping at the first failing step. A batch is not one "
+                "undo action: the result reports undo_steps and an undo_note because "
+                "Office records every applied step separately."
             ),
             "modes": [
                 {
@@ -1064,7 +1334,12 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 {
                     "name": "set",
                     "mode": "write",
-                    "description": "Set a property from 'value'. The expression must end with a property name (no arguments). Supports dry_run.",
+                    "description": (
+                        "Set a property from 'value'. The expression must end with a "
+                        "property name (no arguments). Supports dry_run. Dry-run and "
+                        "applied results both carry value_before when the current value "
+                        "can be read, so a write can be reversed without a separate read."
+                    ),
                     "requires_confirmation": True,
                 },
             ],
@@ -1078,10 +1353,33 @@ def capabilities(settings: Settings) -> dict[str, Any]:
                 "mode": {"type": "string", "required": True, "values": list(MODES)},
                 "root": {"type": "string", "required": False, "values": list(ROOTS), "default": "window"},
                 "expression": {"type": "string", "required": True},
-                "value": {"type": "any", "required": "set mode only"},
+                "value": {
+                    "type": "any",
+                    "required": "set mode only",
+                    "file_reference": (
+                        "CLI: --value @path reads the value from a UTF-8 file (a byte-order "
+                        "mark is accepted). Prefer it for multi-line or Japanese text: "
+                        "shell quoting mangles CR paragraph breaks and non-ASCII arguments."
+                    ),
+                },
                 "dry_run": {"type": "boolean", "required": False},
                 "expected_document": {"type": "string", "required": False},
                 "confirm": {"type": "boolean", "required": True},
+            },
+            "file_arguments": {
+                "com batch --file": (
+                    "Path to a UTF-8 JSON array of steps "
+                    '[{"mode": "get"|"call"|"set", "root": "window", "expression": "...", "value": ...}]. '
+                    "A leading byte-order mark is stripped, so files written by Windows "
+                    "PowerShell 5.1 (Set-Content -Encoding UTF8) work. This is the reliable "
+                    "way to send CR-separated PowerPoint paragraphs: put them in the JSON as "
+                    "\\r instead of building the argument in a shell."
+                ),
+                "com set --value": "@path reads the JSON or plain-text value from a UTF-8 file.",
+                "powerpoint text set --paragraphs": "@path reads the paragraph array from a UTF-8 JSON file.",
+                "powerpoint notes set --text / textbox add --text / text replace --replace": (
+                    "@path reads the text from a UTF-8 file (kept as literal text, not parsed as JSON)."
+                ),
             },
         },
     }

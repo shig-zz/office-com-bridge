@@ -45,6 +45,12 @@ powerpoint_notes_app = typer.Typer(
 powerpoint_document_app = typer.Typer(
     help="PowerPoint presentation commands.", no_args_is_help=True
 )
+powerpoint_toc_app = typer.Typer(
+    help="PowerPoint table-of-contents commands.", no_args_is_help=True
+)
+powerpoint_section_app = typer.Typer(
+    help="PowerPoint section commands.", no_args_is_help=True
+)
 com_app = typer.Typer(
     help="General Office object-model commands (get, call, set).", no_args_is_help=True
 )
@@ -70,6 +76,8 @@ powerpoint_app.add_typer(powerpoint_shape_app, name="shape")
 powerpoint_app.add_typer(powerpoint_textbox_app, name="textbox")
 powerpoint_app.add_typer(powerpoint_notes_app, name="notes")
 powerpoint_app.add_typer(powerpoint_document_app, name="document")
+powerpoint_app.add_typer(powerpoint_toc_app, name="toc")
+powerpoint_app.add_typer(powerpoint_section_app, name="sections")
 app.add_typer(com_app, name="com")
 app.add_typer(target_app, name="target")
 
@@ -287,6 +295,25 @@ def _parse_json_or_string(value: str) -> Any:
         return value
 
 
+def _read_text_file(path: Path) -> str:
+    """Read a CLI file argument as UTF-8, keeping a byte-order mark out and line breaks as-is.
+
+    Windows PowerShell 5.1 writes every `-Encoding UTF8` file with a BOM, and
+    `json.loads` rejects the BOM ("Unexpected UTF-8 BOM"), which used to leave no
+    working way to prepare a JSON step file from the same shell. The BOM is
+    stripped here so the file the shell produced is usable.
+
+    Universal-newline translation is switched off on purpose: a file that carries
+    PowerPoint paragraph breaks as bare CR must keep them, otherwise reading the
+    file would silently turn CR into LF before the value reaches Office.
+    """
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not read {path}: {exc}") from exc
+
+
 def _resolve_value_argument(value: str) -> Any:
     """Parse a --value argument, reading it from a UTF-8 file when prefixed with '@'.
 
@@ -295,12 +322,7 @@ def _resolve_value_argument(value: str) -> Any:
     """
     if not value.startswith("@"):
         return _parse_json_or_string(value)
-    path = Path(value[1:])
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise typer.BadParameter(f"Could not read {path}: {exc}") from exc
-    return _parse_json_or_string(raw)
+    return _parse_json_or_string(_read_text_file(Path(value[1:])))
 
 
 def _shape_argument(value: str) -> Any:
@@ -314,11 +336,21 @@ def _resolve_text_argument(value: str) -> str:
     """Keep PowerPoint text as text; '@path' loads it from a UTF-8 file."""
     if not value.startswith("@"):
         return value
-    path = Path(value[1:])
+    return _read_text_file(Path(value[1:]))
+
+
+def _load_json_argument(value: str) -> Any:
+    """Parse a JSON option that also accepts '@path' to read it from a UTF-8 file."""
+    if not value.startswith("@"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"Invalid JSON: {exc}") from exc
+    raw = _read_text_file(Path(value[1:]))
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise typer.BadParameter(f"Could not read {path}: {exc}") from exc
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON in {value[1:]}: {exc}") from exc
 
 
 def _load_values(json_text: str | None, json_file: Path | None) -> Any:
@@ -326,12 +358,10 @@ def _load_values(json_text: str | None, json_file: Path | None) -> Any:
         raise typer.BadParameter("Provide exactly one of --json or --file.")
     try:
         if json_file is not None:
-            raw = json_file.read_text(encoding="utf-8")
+            raw = _read_text_file(json_file)
         else:
             raw = json_text or ""
         data = json.loads(raw)
-    except OSError as exc:
-        raise typer.BadParameter(f"Could not read {json_file}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise typer.BadParameter(f"Invalid JSON: {exc}") from exc
     if isinstance(data, dict) and "values" in data:
@@ -1491,7 +1521,10 @@ def powerpoint_text_replace(
     replace: str = typer.Option(
         ...,
         "--replace",
-        help="Replacement text, or '@path' to read it from a UTF-8 file.",
+        help=(
+            "Replacement text, or '@path' to read it from a UTF-8 file. Line feeds are "
+            "converted to PowerPoint's CR paragraph break."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -1532,6 +1565,306 @@ def powerpoint_text_replace(
                     raise typer.Exit(1)
             params["confirm"] = True
         return client.invoke("powerpoint.text.replace", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_text_app.command("read")
+def powerpoint_text_read(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+) -> None:
+    """Read one shape's text, paragraph levels and sizes, geometry, and autofit."""
+    _run(
+        ctx,
+        lambda client: client.inspect(
+            "powerpoint.text", {"slide": slide, "shape": _shape_argument(shape)}
+        ),
+    )
+
+
+@powerpoint_text_app.command("get-autofit")
+def powerpoint_text_get_autofit(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+) -> None:
+    """Read a shape's autofit behaviour (none, shape_fits_text, text_fits_shape)."""
+    _run(
+        ctx,
+        lambda client: client.inspect(
+            "powerpoint.text.autofit", {"slide": slide, "shape": _shape_argument(shape)}
+        ),
+    )
+
+
+@powerpoint_text_app.command("set")
+def powerpoint_text_set(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    paragraphs: str = typer.Option(
+        None,
+        "--paragraphs",
+        help=(
+            "JSON array of paragraph strings or {\"text\": ..., \"level\": 2, "
+            "\"font_size\": 13} objects, or '@path' to read that JSON from a UTF-8 file."
+        ),
+    ),
+    text: str = typer.Option(
+        None,
+        "--text",
+        help=(
+            "Plain text split into paragraphs on CR/LF, or '@path' to read it from a "
+            "UTF-8 file. A trailing line break does not add an empty paragraph."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the full text and the planned levels without changing the shape.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Replace one shape's whole text with paragraphs, levels and sizes included."""
+    if bool(paragraphs) == bool(text):
+        raise typer.BadParameter("Provide exactly one of --paragraphs or --text.")
+    if paragraphs is not None:
+        entries = _load_json_argument(paragraphs)
+        if not isinstance(entries, list) or not entries:
+            raise typer.BadParameter("--paragraphs must be a non-empty JSON array.")
+    else:
+        raw = _resolve_text_argument(text)
+        parts = raw.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+        if len(parts) > 1 and parts[-1] == "":
+            parts.pop()
+        entries = parts
+    params: dict[str, Any] = {
+        "slide": slide,
+        "shape": _shape_argument(shape),
+        "paragraphs": entries,
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"replace the text of shape {shape} on slide {slide} with "
+                    f"{len(entries)} paragraph(s) ({sum(len(str(item)) for item in entries)} characters)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.text.set", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_text_app.command("set-format")
+def powerpoint_text_set_format(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    paragraph: str = typer.Option(
+        None,
+        "--paragraph",
+        help='1-based paragraph number or "first-last" range; omit for the whole text frame.',
+    ),
+    font_size: float = typer.Option(None, "--font-size", help="Font size in points (1-400)."),
+    font_name: str = typer.Option(None, "--font-name", help="Font name."),
+    color: str = typer.Option(None, "--color", help="Font color as RRGGBB hex."),
+    bold: bool = typer.Option(None, "--bold/--no-bold", help="Set or clear bold."),
+    indent_level: int = typer.Option(
+        None,
+        "--indent-level",
+        help="Paragraph level (PowerPoint IndentLevel), 1-8.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the current values and the planned change."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Set font and paragraph level on a text frame or on a paragraph range."""
+    params: dict[str, Any] = {"slide": slide, "shape": _shape_argument(shape), "dry_run": dry_run}
+    if paragraph is not None:
+        params["paragraph"] = paragraph
+    if font_size is not None:
+        params["font_size"] = font_size
+    if font_name is not None:
+        params["font_name"] = font_name
+    if color is not None:
+        params["color"] = color
+    if bold is not None:
+        params["bold"] = bold
+    if indent_level is not None:
+        params["indent_level"] = indent_level
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"set text formatting on shape {shape} of slide {slide}"
+                    + (f" (paragraphs {paragraph})" if paragraph else ""),
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.text.set_format", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_text_app.command("set-autofit")
+def powerpoint_text_set_autofit(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    behavior: str = typer.Option(
+        ...,
+        "--behavior",
+        help="none, shape (grow the frame to fit the text), or text (shrink text on overflow).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the current autofit state without changing it."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Set a shape's autofit behaviour and read it back from PowerPoint."""
+    params: dict[str, Any] = {
+        "slide": slide,
+        "shape": _shape_argument(shape),
+        "behavior": behavior,
+        "dry_run": dry_run,
+    }
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"set autofit behavior {behavior!r} on shape {shape} of slide {slide}",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.text.set_autofit", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_text_app.command("measure")
+def powerpoint_text_measure(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="1-based slide number."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name on the slide.",
+    ),
+    text: str = typer.Option(
+        None,
+        "--text",
+        help="Draft text to measure, or '@path' to read it from a UTF-8 file; omit to measure the current text.",
+    ),
+    font_size: float = typer.Option(
+        None, "--font-size", help="Optional point size to test before writing it."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the frame and text without duplicating the shape."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to run unless the attached document matches this name.",
+    ),
+) -> None:
+    """Measure the height the text needs by growing a throw-away duplicate."""
+    params: dict[str, Any] = {"slide": slide, "shape": _shape_argument(shape), "dry_run": dry_run}
+    if text is not None:
+        params["text"] = _resolve_text_argument(text)
+    if font_size is not None:
+        params["font_size"] = font_size
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"measure the text height of shape {shape} on slide {slide} "
+                    "(temporarily duplicates and deletes the shape)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.text.measure", params)
 
     _run(ctx, action)
 
@@ -1767,6 +2100,98 @@ def powerpoint_slide_add(
     _run(ctx, action)
 
 
+@powerpoint_toc_app.command("fill")
+def powerpoint_toc_fill(
+    ctx: typer.Context,
+    slide: int = typer.Argument(..., help="The slide holding the table-of-contents placeholder."),
+    shape: str = typer.Option(
+        ...,
+        "--shape",
+        help="1-based shape index or shape name of the body placeholder.",
+    ),
+    start: int = typer.Option(
+        None, "--from", help="First slide to collect titles from (default 1)."
+    ),
+    end: int = typer.Option(
+        None, "--to", help="Last slide to collect titles from (default: the last slide)."
+    ),
+    exclude: str = typer.Option(
+        None,
+        "--exclude",
+        help="Comma-separated slide numbers to skip; the TOC slide itself is always skipped.",
+    ),
+    levels: str = typer.Option(
+        None,
+        "--levels",
+        help='"auto" (a title listed in another slide\'s body text becomes level 2) or a spec such as "6-12=2,15=2".',
+    ),
+    numbering: str = typer.Option(
+        None,
+        "--numbering",
+        help="auto (reuse the style already in the placeholder), fullwidth-dot, ascii-dot, digits, none.",
+    ),
+    font_size: float = typer.Option(
+        None, "--font-size", help="Point size for level-1 entries."
+    ),
+    sub_font_size: float = typer.Option(
+        None, "--sub-font-size", help="Point size for level 2 and deeper entries."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Preview the exact final text and the slide mapping."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip the interactive confirmation prompt."
+    ),
+    expected_document: str = typer.Option(
+        None,
+        "--expected-document",
+        help="Refuse to write unless the attached document matches this name.",
+    ),
+) -> None:
+    """Fill a table-of-contents placeholder from the deck's slide titles."""
+    params: dict[str, Any] = {"slide": slide, "shape": _shape_argument(shape), "dry_run": dry_run}
+    if start is not None:
+        params["from"] = start
+    if end is not None:
+        params["to"] = end
+    if exclude is not None:
+        params["exclude"] = exclude
+    if levels is not None:
+        params["levels"] = levels
+    if numbering is not None:
+        params["numbering"] = numbering
+    if font_size is not None:
+        params["font_size"] = font_size
+    if sub_font_size is not None:
+        params["sub_font_size"] = sub_font_size
+    if expected_document:
+        params["expected_document"] = expected_document
+
+    def action(client: BridgeClient) -> dict[str, Any]:
+        if not dry_run:
+            if not yes:
+                _reject_unsafe_console()
+                if not _confirm_write(
+                    ctx,
+                    client,
+                    f"rewrite the table of contents in shape {shape} of slide {slide} "
+                    "from the slide titles (dry-run first to review every entry)",
+                    expected_document,
+                ):
+                    typer.echo("Aborted.", err=True)
+                    raise typer.Exit(1)
+            params["confirm"] = True
+        return client.invoke("powerpoint.toc.fill", params)
+
+    _run(ctx, action)
+
+
+@powerpoint_section_app.command("read")
+def powerpoint_sections_read(ctx: typer.Context) -> None:
+    """Read the presentation's sections with their slide ranges."""
+    _run(ctx, lambda client: client.inspect("powerpoint.sections", {}))
+
+
 @app.command("set-property")
 def set_property(
     ctx: typer.Context,
@@ -1877,7 +2302,12 @@ def com_set(
     value: str = typer.Option(
         ...,
         "--value",
-        help="JSON value or plain string, for example 42, true, \"text\", [[1,2],[3,4]].",
+        help=(
+            "JSON value or plain string, for example 42, true, \"text\", [[1,2],[3,4]]. "
+            "'@path' reads the value from a UTF-8 file (BOM accepted): use it for "
+            "multi-line or Japanese text, and for PowerPoint paragraphs whose CR breaks "
+            "shells destroy."
+        ),
     ),
     root: str = _com_root_option(),
     dry_run: bool = typer.Option(
@@ -1927,7 +2357,11 @@ def com_batch(
         "--file",
         help=(
             'UTF-8 JSON file with an array of steps: '
-            '[{"mode": "get"|"call"|"set", "root": "window", "expression": "...", "value": ...}, ...]'
+            '[{"mode": "get"|"call"|"set", "root": "window", "expression": "...", "value": ...}, ...]. '
+            'A byte-order mark is accepted, so files written by Windows PowerShell 5.1 '
+            '(Set-Content -Encoding UTF8) load as-is. This is the reliable way to send '
+            'multi-line or Japanese text: put PowerPoint paragraph breaks in the JSON as \\r '
+            'instead of building the value on the command line.'
         ),
     ),
     dry_run: bool = typer.Option(
@@ -1947,12 +2381,11 @@ def com_batch(
     """Run several com steps in one request with one confirmation.
 
     Steps run in order and the batch stops at the first failure, so review the
-    whole step list with the user before approving it.
+    whole step list with the user before approving it. One approval does not mean
+    one undo: Office records every applied step as its own undo action, and the
+    result reports how many steps were applied (undo_steps).
     """
-    try:
-        raw = file.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise typer.BadParameter(f"Could not read {file}: {exc}") from exc
+    raw = _read_text_file(file)
     try:
         steps = json.loads(raw)
     except json.JSONDecodeError as exc:

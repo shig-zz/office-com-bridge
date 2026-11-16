@@ -349,3 +349,95 @@ def test_com_section_in_capabilities() -> None:
     assert [mode["name"] for mode in com["modes"]] == ["get", "call", "set"]
     assert com["roots"] == ["application", "window", "document"]
     assert "window" in com["examples"]["get"]
+
+
+def test_powerpoint_text_and_toc_operations_are_listed() -> None:
+    cap = registry.capabilities(_settings)
+    operations = [item["name"] for item in cap["operations"]]
+    for name in (
+        "powerpoint.text.set",
+        "powerpoint.text.set_format",
+        "powerpoint.text.set_autofit",
+        "powerpoint.text.measure",
+        "powerpoint.toc.fill",
+    ):
+        assert name in operations
+    inspections = [item["name"] for item in cap["inspections"]]
+    for name in ("powerpoint.text", "powerpoint.text.autofit", "powerpoint.sections"):
+        assert name in inspections
+
+
+def test_com_capabilities_expose_file_arguments() -> None:
+    cap = registry.capabilities(_settings)
+    com = cap["com"]
+    assert "@path" in com["params"]["value"]["file_reference"]
+    assert "com batch --file" in com["file_arguments"]
+    assert "byte-order mark" in com["file_arguments"]["com batch --file"]
+    assert "undo_steps" in com["description"]
+    set_mode = next(mode for mode in com["modes"] if mode["name"] == "set")
+    assert "value_before" in set_mode["description"]
+
+
+def test_toc_fill_dispatches_through_the_registry() -> None:
+    from test_powerpoint_ops import FakeSlide
+    from test_powerpoint_ops import make_target as make_deck_target
+
+    deck = make_deck_target(
+        [
+            FakeSlide(1, "表紙", "cover"),
+            FakeSlide(2, "目次", "０．"),
+            FakeSlide(3, "部品", "body"),
+        ]
+    )
+    result = registry.invoke(
+        deck,
+        "powerpoint.toc.fill",
+        {"slide": 2, "shape": 2, "dry_run": True},
+        _settings,
+    )
+    assert result["entry_count"] == 2
+    assert result["preview_text"] == "０．表紙\r１．部品"
+
+
+def test_powerpoint_text_writes_require_powerpoint_app() -> None:
+    for operation in (
+        "powerpoint.text.set",
+        "powerpoint.text.set_autofit",
+        "powerpoint.text.measure",
+        "powerpoint.toc.fill",
+    ):
+        with pytest.raises(BridgeError) as excinfo:
+            registry.invoke(make_target(AppKind.EXCEL), operation, {}, _settings)
+        assert excinfo.value.code == ErrorCode.UNSUPPORTED_APPLICATION
+
+
+def test_sections_inspection_reads_section_properties() -> None:
+    from test_powerpoint_ops import FakeSlide
+    from test_powerpoint_ops import make_target as make_deck_target
+
+    deck = make_deck_target(
+        [FakeSlide(1, "A", "a"), FakeSlide(2, "B", "b")],
+        sections=[("はじめに", 1, 2)],
+    )
+    result = registry.inspect(deck, "powerpoint.sections", {}, _settings)
+    assert result["section_count"] == 1
+    assert result["sections"][0]["name"] == "はじめに"
+    assert result["sections"][0]["first_slide"] == 1
+    assert result["sections"][0]["last_slide"] == 2
+
+
+def test_text_inspection_dispatches_to_powerpoint() -> None:
+    from test_powerpoint_ops import FakeSlide
+    from test_powerpoint_ops import make_target as make_deck_target
+
+    deck = make_deck_target([FakeSlide(1, "Title", "first\rsecond")])
+    result = registry.inspect(
+        deck, "powerpoint.text", {"slide": 1, "shape": 2}, _settings
+    )
+    assert result["text"] == "first\rsecond"
+    assert result["paragraph_count"] == 2
+
+    autofit = registry.inspect(
+        deck, "powerpoint.text.autofit", {"slide": 1, "shape": 2}, _settings
+    )
+    assert "autofit" in autofit

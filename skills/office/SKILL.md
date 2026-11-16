@@ -68,6 +68,18 @@ Prefer the narrowest read that answers the question. The examples below omit
 | Word document counts | `office word document read` |
 | Current PowerPoint slide and shapes | `office powerpoint slide inspect` |
 | PowerPoint slide titles | `office powerpoint document read` |
+| PowerPoint slides in a window: titles, notes, and every shape's index, name, type, text, and geometry | `office powerpoint slides read --start 21 --count 10` |
+| One shape's text with paragraph levels, font sizes, geometry, and autofit | `office powerpoint text read 3 --shape 3` |
+| A shape's autofit behaviour (none / shape_fits_text / text_fits_shape) | `office powerpoint text get-autofit 3 --shape 3` |
+| PowerPoint section names with their slide ranges | `office powerpoint sections read` |
+| Word paragraphs with style names and heading flags | `office word paragraphs read --start 1 --count 50` |
+| Excel cell formatting of a range | `office excel range read-format "A1:D20"` |
+
+One wide read beats many `com get` calls. Before collecting shape names, types,
+positions, or font sizes one by one through `office com`, check whether
+`powerpoint slides read`, `powerpoint text read`, `word paragraphs read`, or
+`excel range read-format` already returns them: those four cover most surveying
+in one or two requests instead of twenty.
 
 The bridge limits large reads (default: 10,000 cells and 100,000 text characters). If `RANGE_TOO_LARGE` or `TEXT_TOO_LARGE` is returned, request a smaller range or a smaller excerpt. Do not retry the same request.
 
@@ -208,6 +220,84 @@ office word selection insert-text "追記します。" --yes --expected-document
 
 `--replace` is the default; use `--no-replace` only when the user explicitly wants insertion at the start of the selection.
 
+PowerPoint text:
+
+PowerPoint separates paragraphs with CR (U+000D), not LF. The curated writes
+convert LF and CRLF to CR and report `paragraph_breaks` and
+`newline_conversions`, so the same value behaves the same whichever way it was
+typed. In a raw `com` expression, put real CRs in the value yourself.
+
+Do not build multi-line or Japanese text on the command line: shells drop CR and
+mangle non-ASCII arguments. Every text option takes `@path`, which reads the
+value from a UTF-8 file, and a file written by Windows PowerShell (which carries
+a byte-order mark) is accepted:
+
+```text
+office powerpoint text set 3 --shape 3 --paragraphs @paragraphs.json --dry-run --expected-document "Deck.pptx"
+office powerpoint text set 3 --shape 3 --paragraphs @paragraphs.json --yes --expected-document "Deck.pptx"
+```
+
+`paragraphs.json` holds one entry per paragraph with the level and size it should
+end up at; the levels and sizes are applied with `TextRange.Paragraphs(first,
+count)` inside the same operation, so no follow-up `com set` calls are needed:
+
+```json
+[
+  {"text": "０．表紙", "level": 1, "font_size": 16},
+  {"text": "アルミフレーム", "level": 2, "font_size": 13}
+]
+```
+
+Other curated PowerPoint writes:
+
+- `office powerpoint text replace SLIDE --shape N --find X --replace Y` — in-place
+  replacement that keeps the shape's formatting; `--replace @path` for long text.
+- `office powerpoint text set-format SLIDE --shape N --paragraph 4-10 --indent-level 2 --font-size 13`
+  — font and paragraph level on one paragraph block, or on the whole text frame
+  when `--paragraph` is omitted. `--paragraph 4-10` is the two-argument
+  `Paragraphs(first, count)` form, which is also useful directly in a `com`
+  expression: `.Paragraphs(4, 7).IndentLevel` sets seven paragraphs in one call.
+- `office powerpoint text set SLIDE --shape N --text @body.txt` — replaces the
+  shape's whole text; `--text` splits on CR/LF, `--paragraphs` takes the JSON form.
+- `office powerpoint textbox add SLIDE --text @text.txt --left 146 --top 75 --width 422 --height 442`
+  — a new text box, with a fit check against the box you asked for.
+- `office powerpoint notes set SLIDE --text @notes.txt` — speaker notes.
+- `office powerpoint shape set-format`, `shape delete`, `slide add`, `slide move`,
+  `slide delete` — the slide and shape structure.
+
+Filling a table of contents:
+
+```text
+office powerpoint toc fill 3 --shape 3 --from 1 --to 24 --exclude 5 --levels auto --font-size 16 --sub-font-size 13 --dry-run --expected-document "Deck.pptx"
+```
+
+`toc fill` collects the slide titles in the range, reuses the numbering style
+already present in the placeholder (full-width digits and a full-width stop such
+as `０．`, or `1. ` with half-width digits), numbers only level-1 entries, keeps
+the contents slide out of its own list, and previews the exact final text in the
+dry-run. `--levels "6-12=2"` states the hierarchy; `--levels auto` marks a title
+level 2 when another slide lists it in its body text. The applied result reports
+`numbering_style`, `entries` (slide number, level, and text per entry),
+`paragraphs_before` / `paragraphs_after`, and `verified`.
+
+Fitting text into a frame:
+
+- `office powerpoint text measure 3 --shape 3 --text @draft.txt --font-size 16`
+  duplicates the shape, lets the duplicate grow to fit, and reports
+  `required_height`, `fits`, and `margin`; the duplicate is deleted afterwards.
+  Use it to choose a font size instead of guessing. It briefly creates and
+  deletes a shape, so the write workflow applies.
+- `office powerpoint text set-autofit 3 --shape 3 --behavior text` sets "Shrink
+  text on overflow" (the UI name; `TextFrame2.AutoSize = 2`) and reads the result
+  back. `--behavior shape` grows the frame to the text, `--behavior none` clears
+  autofit. `office powerpoint text get-autofit` reads the current setting.
+- If Office refuses, the code is `AUTOFIT_REFUSED` and `details` carries both
+  enum tables: `TextFrame.AutoSize` takes PpAutoSize (0, 1, -2) and cannot
+  express shrinking at all, while `TextFrame2.AutoSize` takes MsoAutoSize (0, 1,
+  2, -2). Do not probe other numbers through `com set`; the practical fallbacks
+  are a smaller explicit font size and setting autofit once in the UI or the
+  template.
+
 ## Working across several documents
 
 The bridge routes each command to one registered `target_id`; comparing, merging,
@@ -290,6 +380,32 @@ office com set 'window.Selection.Font.Bold' --value true
     cell. A mismatched flat array is rejected instead of silently writing the
     leading cells and clearing the rest — Excel coerces such arrays without an
     error, so this guard is what keeps partial writes from happening.
+
+Getting values into `com` without fighting the shell:
+
+- `com set EXPR --value @path` reads the value from a UTF-8 file: JSON when the
+  file parses as JSON, otherwise the literal text. A leading byte-order mark is
+  stripped, and the file's line breaks are kept exactly as written, so a
+  PowerPoint paragraph break written as CR in the file arrives as CR. Inside a
+  JSON file, write the break as the `\r` escape instead.
+- `com batch --file steps.json` runs an array of steps in one request with one
+  confirmation:
+  `[{"mode": "set", "expression": "document.Slides(3).Shapes(3).TextFrame.TextRange.Text", "value": "０．表紙\r１．改定履歴"}, {"mode": "set", "expression": "document.Slides(3).Shapes(3).TextFrame.TextRange.Paragraphs(4, 7).IndentLevel", "value": 2}]`.
+  Steps run in order and the batch stops at the first failure, so review the
+  whole step list with the user before approving it. `--dry-run` marks every
+  step as a dry run. This is the reliable way to send multi-line or Japanese
+  text; a file written by `Set-Content -Encoding UTF8` (with a BOM) loads as-is.
+- A batch is not one undo action: Office records each applied step separately and
+  the result reports `undo_steps` plus an `undo_note`. Undoing a batch means
+  repeating undo and checking the document, or re-applying the previous values.
+- `com set` reports `value_before` (with `value_before_truncated` for long text)
+  in the dry-run preview and in the applied result whenever the current value can
+  be read, so a change can be reversed from the same payload. A parameterized
+  property that cannot be read as a property reports `value_before_note` instead.
+- Windows PowerShell 5.1 writes a byte-order mark for every `-Encoding UTF8` file
+  and its console encoding mangles non-ASCII arguments. Keep Japanese text in
+  UTF-8 data files instead of `.ps1` string literals, and set
+  `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8` when reading output.
 
 Use numeric enum values in call arguments (Excel: xlInsertShiftDown = -4107,
 xlDeleteShiftUp = -4122, xlDeleteShiftLeft = -4121; PowerPoint: msoShapeRectangle = 1,
@@ -385,6 +501,8 @@ around the blocklist (for example via a macro).
   - `DOCUMENT_MISMATCH`: the routed target's document is not the one named in `--expected-document`; the ids/paths in `details` show which is which.
   - `CONFIRMATION_REQUIRED`: call again with `--yes` only after user approval.
   - `OPERATION_BLOCKED`: the operation is save/close family; ask the user to do it in Office.
+  - `AUTOFIT_REFUSED`: Office rejected an autofit value; `details.autosize_enums` lists the values each autofit member accepts and `details.hresult` is what Office reported. Use `office powerpoint text set-autofit`, lower the font size deliberately, or ask the user to set it in the UI — do not probe other numbers.
+  - `TEXT_FRAME_MISSING`: the expression reached `TextFrame` / `TextRange` on a shape that has no text frame (`details.has_text_frame: 0` plus the shape's name, type, and index). It is the wrong shape, not a typo; `office powerpoint slides read` lists the text-bearing shapes.
   - `OFFICE_BUSY` or `OFFICE_NO_RESPONSE`: Office is busy. Do not retry a write blindly; re-check the target first.
 - Exit code 0 means the request succeeded. Exit code 1 means the bridge returned an error. Exit code 2 means the bridge was unreachable or the command was invalid.
 
